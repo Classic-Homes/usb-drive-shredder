@@ -86,20 +86,32 @@ is_usb_device() {
     return 0
   fi
 
-  # Method 2: Check for USB in device path
+  # Method 2: Check for USB in device path (most reliable for USB-SATA bridges)
   local device_path=$(udevadm info --query=path --name="$device" 2>/dev/null)
-  if [[ "$device_path" =~ usb ]]; then
+  if [[ "$device_path" =~ /usb[0-9]+/ ]]; then
     return 0
   fi
 
-  # Method 3: Check if device vendor/model contains USB indicators
+  # Method 3: Check if device vendor/model contains USB indicators or known USB bridge names
   local vendor=$(udevadm info --query=property --name="$device" 2>/dev/null | grep "ID_VENDOR=" | cut -d'=' -f2 || echo "")
   local model=$(udevadm info --query=property --name="$device" 2>/dev/null | grep "ID_MODEL=" | cut -d'=' -f2 || echo "")
-  if [[ "$vendor" =~ [Uu][Ss][Bb] ]] || [[ "$model" =~ [Uu][Ss][Bb] ]]; then
+
+  # Check for USB keywords or known USB bridge devices
+  if [[ "$vendor" =~ [Uu][Ss][Bb] ]] || [[ "$model" =~ [Uu][Ss][Bb] ]] || [[ "$model" =~ Bridge ]]; then
     return 0
   fi
 
-  # Method 4: For Proxmox passthrough, check if device is not sda (usually the system drive)
+  # Method 4: Check alternative vendor/model from /sys if udev didn't provide them
+  if [[ "$vendor" == "" ]] && [[ "$model" == "" ]]; then
+    vendor=$(cat "/sys/block/$device_name/device/vendor" 2>/dev/null | tr -d ' ' || echo "")
+    model=$(cat "/sys/block/$device_name/device/model" 2>/dev/null | tr -d ' ' || echo "")
+
+    if [[ "$vendor" =~ [Uu][Ss][Bb] ]] || [[ "$model" =~ [Uu][Ss][Bb] ]] || [[ "$model" =~ Bridge ]]; then
+      return 0
+    fi
+  fi
+
+  # Method 5: For Proxmox passthrough, check if device is not sda (usually the system drive)
   # and appears to be a removable/external device
   if [[ "$device_name" != "sda" ]]; then
     # Check if device is removable
@@ -110,7 +122,6 @@ is_usb_device() {
 
     # In Proxmox passthrough scenarios, USB drives might appear as regular SCSI devices
     # Check if this is likely a non-system drive
-    local rotational=$(cat "/sys/block/$device_name/queue/rotational" 2>/dev/null || echo "1")
     local size_bytes=$(blockdev --getsize64 "$device" 2>/dev/null || echo "0")
 
     # If it's not the first drive (sda) and has characteristics of external storage
