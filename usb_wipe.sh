@@ -196,8 +196,13 @@ get_safety_level() {
   local device="$1"
 
   # Check if device exists and is accessible
+  if [[ ! -e "$device" ]]; then
+    echo "ERROR|Device does not exist or is not accessible"
+    return
+  fi
+
   if [[ ! -b "$device" ]]; then
-    echo "ERROR|Device does not exist or is not a block device"
+    echo "ERROR|Not a block device"
     return
   fi
 
@@ -213,8 +218,14 @@ get_safety_level() {
   fi
 
   if [[ "$(uname)" == "Darwin" ]]; then
-    # macOS specific checks - get all info at once to reduce diskutil calls
-    local device_info=$(diskutil info "$device" 2>/dev/null)
+    # macOS specific checks with better error handling
+    local device_info
+    device_info=$(diskutil info "$device" 2>/dev/null || echo "")
+    
+    if [[ -z "$device_info" ]]; then
+      echo "CAUTION|Failed to get device information"
+      return
+    }
     
     # Check if it's an internal disk (dangerous)
     if echo "$device_info" | grep -q "Internal: *Yes"; then
@@ -222,80 +233,72 @@ get_safety_level() {
       return
     fi
     
-    # Check if device has any mounted partitions
-    local mount_point=$(echo "$device_info" | grep "Mount Point" | sed 's/.*Mount Point: *//')
-    if [[ -n "$mount_point" && "$mount_point" != "(not mounted)" ]]; then
-      echo "CAUTION|Currently mounted at: $mount_point"
+    # Check if it's a boot disk (dangerous)
+    if echo "$device_info" | grep -q "Boot: *Yes"; then
+      echo "DANGEROUS|Boot disk - contains OS"
       return
     fi
     
-    # Check device size (very small devices might be system)
-    local size=$(echo "$device_info" | grep "Disk Size" | awk '{print $3}')
-    if [[ $size -lt 100 ]]; then # < 100MB
-      echo "DANGEROUS|Very small device (< 100MB) - may be system"
+    # Check logical volume group (could indicate system disk)
+    if echo "$device_info" | grep -q "Part of Whole: *disk0"; then
+      echo "DANGEROUS|Part of system disk (disk0)"
       return
     fi
     
-    # Check if it's a USB device (safer to wipe)
-    if echo "$device_info" | grep -q "Protocol: *USB"; then
-      echo "SAFE|USB device detected"
-      return
-    fi
-    
-    # Check if it's removable
-    if echo "$device_info" | grep -q "Removable Media: *Yes"; then
-      echo "SAFE|Removable media detected"
-      return
-    fi
-    
-  else
-    # Linux specific checks
-    
-    # Check if device has any mounted partitions
+    # Check mounted partitions
     if has_mounted_partitions "$device"; then
-      local mounts=$(mount | grep "^${device}\|^/dev/$(basename "$device")" | awk '{print $3}' | tr '\n' ' ' | sed 's/ $//')
-      if [[ -n "$mounts" ]]; then
-        echo "CAUTION|Currently mounted at: $mounts"
-        return
-      fi
-    fi
-
-    # Check if device has Linux filesystems
-    if lsblk -n -o FSTYPE "$device" 2>/dev/null | grep -q -E "ext[2-4]|xfs|btrfs"; then
-      echo "CAUTION|Contains Linux filesystem"
+      echo "CAUTION|Has mounted partitions - unmount first"
       return
     fi
-
-    # Check if device has swap
-    if lsblk -n -o FSTYPE "$device" 2>/dev/null | grep -q "swap"; then
-      echo "DANGEROUS|Contains swap partition"
+    
+    # If drive contains "physical" in the description, it's likely a physical disk
+    if echo "$device_info" | grep -q "Media Name.*Physical"; then
+      echo "SAFE|Removable physical media"
       return
     fi
-
-    # Check device size (very small devices might be system)
-    local size_bytes
-    size_bytes=$(blockdev --getsize64 "$device" 2>/dev/null || echo "0")
-    if [[ $size_bytes -lt 104857600 ]]; then # < 100MB
-      echo "DANGEROUS|Very small device (< 100MB) - may be system"
+    
+    # Check if it's USB, which is typically safer
+    if echo "$device_info" | grep -q "Protocol.*USB"; then
+      echo "SAFE|USB device"
       return
     fi
-
-    # Special handling for sda (usually system drive)
-    if [[ "$(basename "$device")" == "sda" ]]; then
-      echo "CAUTION|First drive (sda) - typically system drive"
+    
+    # Default to caution if we're not sure
+    echo "CAUTION|Unknown drive type - verify before wiping"
+  else
+    # Linux checks - similar to macOS but with Linux-specific commands
+    
+    # Check if it's a primary system disk  
+    if echo "$device" | grep -q "sd[a-z]$" && [[ "$device" == "/dev/sda" ]]; then
+      echo "DANGEROUS|Likely system disk (sda)"
       return
     fi
-
-    # Check if it's a USB device (safer to wipe)
-    local id_bus
-    id_bus=$(udevadm info --query=property --name="$device" 2>/dev/null | grep "ID_BUS=" | cut -d'=' -f2 || echo "")
-    if [[ "$id_bus" == "usb" ]]; then
-      echo "SAFE|USB device detected"
+    
+    # Check if it has mounted partitions
+    if has_mounted_partitions "$device"; then
+      echo "CAUTION|Has mounted partitions - unmount first"
       return
     fi
+    
+    # Check if it's a USB device (safer)
+    local bus
+    bus=$(udevadm info --query=property --name="$device" 2>/dev/null | grep ID_BUS= | cut -d= -f2)
+    if [[ "$bus" == "usb" ]]; then
+      echo "SAFE|USB device"
+      return
+    fi
+    
+    # Check if it's removable (safer)
+    local removable
+    removable=$(cat /sys/block/$(basename "$device")/removable 2>/dev/null)
+    if [[ "$removable" == "1" ]]; then
+      echo "SAFE|Removable media"
+      return
+    fi
+    
+    # Default to caution if we're not sure
+    echo "CAUTION|Unknown drive type - verify before wiping"
   fi
-
-  echo "SAFE|No safety concerns detected"
 }
 
 # Function to get basic drive info
@@ -303,50 +306,92 @@ get_drive_info() {
   local device="$1"
   local vendor="Unknown"
   local model="Unknown"
-  local serial="Unknown"
   local size="Unknown"
+  local serial="Unknown"
   local bus="Unknown"
 
-  if [[ "$(uname)" == "Darwin" ]]; then
-    # macOS version - get all info at once
-    local device_info=$(diskutil info "$device" 2>/dev/null)
-    
-    # Extract all needed information from the single diskutil call
-    size=$(echo "$device_info" | grep "Disk Size" | awk '{print $3" "$4}' || echo "Unknown")
-    
-    # Try to extract vendor and model from device name
-    vendor=$(echo "$device_info" | grep "Device / Media Name:" | sed 's/.*Device \/ Media Name: *//' | awk '{print $1}' || echo "Unknown")
-    model=$(echo "$device_info" | grep "Device / Media Name:" | sed 's/.*Device \/ Media Name: *//' | awk '{for(i=2;i<=NF;i++) print $i}' | tr '\n' ' ' | sed 's/ $//' || echo "Unknown")
-    
-    # Get protocol/bus type
-    bus=$(echo "$device_info" | grep "Protocol:" | sed 's/.*Protocol: *//' || echo "Unknown")
-    
-    # Get serial if available
-    serial=$(echo "$device_info" | grep -i "Serial Number:" | sed 's/.*Serial Number: *//' || echo "Unknown")
-    
-  else
-    # Linux version
-    # Get size from lsblk
-    size=$(lsblk -d -n -o SIZE "$device" 2>/dev/null || echo "Unknown")
-
-    # Try to get info from udev
-    if command -v udevadm >/dev/null 2>&1; then
-      vendor=$(udevadm info --query=property --name="$device" 2>/dev/null | grep "^ID_VENDOR=" | cut -d'=' -f2 || echo "Unknown")
-      model=$(udevadm info --query=property --name="$device" 2>/dev/null | grep "^ID_MODEL=" | cut -d'=' -f2 || echo "Unknown")
-      serial=$(udevadm info --query=property --name="$device" 2>/dev/null | grep "^ID_SERIAL_SHORT=" | cut -d'=' -f2 || echo "Unknown")
-      bus=$(udevadm info --query=property --name="$device" 2>/dev/null | grep "^ID_BUS=" | cut -d'=' -f2 || echo "Unknown")
-    fi
-
-    # If udev didn't work, try /sys
-    local basename_device=$(basename "$device")
-    if [[ "$vendor" == "Unknown" && -f "/sys/block/$basename_device/device/vendor" ]]; then
-      vendor=$(cat "/sys/block/$basename_device/device/vendor" 2>/dev/null | tr -d ' ' || echo "Unknown")
-    fi
-    if [[ "$model" == "Unknown" && -f "/sys/block/$basename_device/device/model" ]]; then
-      model=$(cat "/sys/block/$basename_device/device/model" 2>/dev/null | tr -d ' ' || echo "Unknown")
-    fi
+  # Check if device exists
+  if [[ ! -e "$device" ]]; then
+    echo "Unknown|Unknown|Unknown|Unknown|Unknown"
+    return
   fi
 
+  if [[ "$(uname)" == "Darwin" ]]; then
+    # macOS version with better error handling
+    # Use diskutil info for comprehensive information
+    local device_info
+    device_info=$(diskutil info "$device" 2>/dev/null || echo "")
+    
+    if [[ -z "$device_info" ]]; then
+      echo "Unknown|Unknown|Unknown|Unknown|Unknown"
+      return
+    fi
+    
+    # Extract device information with fallbacks
+    vendor=$(echo "$device_info" | grep -i "Device / Media Name" | sed 's/.*Device \/ Media Name: *//' | awk '{print $1}' || echo "Unknown")
+    model=$(echo "$device_info" | grep -i "Device Model" | sed 's/.*Device Model: *//' || echo "Unknown")
+    
+    # If we couldn't get model, try another field
+    if [[ "$model" == "Unknown" ]]; then
+      model=$(echo "$device_info" | grep -i "Media Name" | sed 's/.*Media Name: *//' || echo "Unknown")
+    fi
+    
+    # Get size in human readable format
+    size=$(echo "$device_info" | grep -i "Disk Size" | sed 's/.*Disk Size: *//' | awk '{print $1" "$2}' || echo "Unknown")
+    
+    # Get serial number
+    serial=$(echo "$device_info" | grep -i "Serial Number" | sed 's/.*Serial Number: *//' || echo "Unknown")
+    
+    # Try to determine bus type from device path
+    if echo "$device" | grep -q "disk[0-9]*$"; then
+      local disk_id=$(echo "$device" | sed 's/.*disk\([0-9][0-9]*\)$/\1/')
+      if system_profiler SPUSBDataType 2>/dev/null | grep -A10 "disk$disk_id" | grep -q "Serial Number"; then
+        bus="USB"
+      elif system_profiler SPFireWireDataType 2>/dev/null | grep -A10 "disk$disk_id" | grep -q "Serial Number"; then
+        bus="FireWire"
+      elif system_profiler SPThunderboltDataType 2>/dev/null | grep -A10 "disk$disk_id" | grep -q "Serial Number"; then
+        bus="Thunderbolt"
+      elif system_profiler SPSATADataType 2>/dev/null | grep -A10 "disk$disk_id" | grep -q "Serial Number"; then
+        bus="SATA"
+      elif system_profiler SPNVMeDataType 2>/dev/null | grep -A10 "disk$disk_id" | grep -q "Serial Number"; then
+        bus="NVMe"
+      else
+        bus="Unknown"
+      fi
+    fi
+  else
+    # Linux version (unchanged)
+    # Get vendor and model
+    if udevadm info --query=property --name="$device" 2>/dev/null | grep -q ID_VENDOR; then
+      vendor=$(udevadm info --query=property --name="$device" 2>/dev/null | grep ID_VENDOR= | cut -d= -f2)
+      model=$(udevadm info --query=property --name="$device" 2>/dev/null | grep ID_MODEL= | cut -d= -f2)
+    else
+      # Fallback to lsblk
+      vendor=$(lsblk -d -no vendor "$device" 2>/dev/null || echo "Unknown")
+      model=$(lsblk -d -no model "$device" 2>/dev/null || echo "Unknown")
+    fi
+
+    # Get size
+    size=$(lsblk -d -no size "$device" 2>/dev/null || echo "Unknown")
+    
+    # Get serial number
+    serial=$(udevadm info --query=property --name="$device" 2>/dev/null | grep ID_SERIAL_SHORT= | cut -d= -f2 || echo "Unknown")
+    
+    # Get bus information
+    bus=$(udevadm info --query=property --name="$device" 2>/dev/null | grep ID_BUS= | cut -d= -f2 || echo "Unknown")
+    
+    # Capitalize bus
+    bus=$(echo "$bus" | tr '[:lower:]' '[:upper:]')
+  fi
+
+  # Clean up any empty values
+  if [[ -z "$vendor" ]]; then vendor="Unknown"; fi
+  if [[ -z "$model" ]]; then model="Unknown"; fi
+  if [[ -z "$size" ]]; then size="Unknown"; fi
+  if [[ -z "$serial" ]]; then serial="Unknown"; fi
+  if [[ -z "$bus" ]]; then bus="Unknown"; fi
+  
+  # Return formatted result
   echo "$vendor|$model|$size|$serial|$bus"
 }
 
@@ -385,34 +430,41 @@ display_drives() {
   
   for i in "${!drives[@]}"; do
     local device="${drives[$i]}"
-    local percent=$((100 * i / total_drives))
+    local percent=$((100 * (i+1) / total_drives))
     local drive_number=$((i + 1))
     
-    # Show progress bar with drive info
-    printf "\r[%-50s] %d%% (Drive %d/%d: %s)" "$(printf '#%.0s' $(seq 1 $((50 * i / total_drives))))" "$percent" "$drive_number" "$total_drives" "$(basename "$device")"
+    # Show detailed progress with device info
+    printf "\r[%-50s] %3d%% | Drive %d/%d: %s " \
+           "$(printf '#%.0s' $(seq 1 $((50 * (i+1) / total_drives))))" \
+           "$percent" "$drive_number" "$total_drives" "$(basename "$device")"
     
-    # Get and cache drive info with timeout
+    # Get and cache drive info with timeout and better feedback
     if [[ "$(uname)" == "Darwin" ]]; then
-      # Use the run_with_timeout function for macOS
+      echo -n "- Getting info..."
       drive_info_cache["$device"]=$(run_with_timeout $timeout_seconds get_drive_info "$device")
       if [[ "${drive_info_cache[$device]}" == "TIMEOUT" ]]; then
         drive_info_cache["$device"]="Unknown|Unknown|Unknown|Unknown|Unknown"
-        echo -e "\n${YELLOW}Warning: Timeout while getting info for $device${NC}"
+        echo -ne "\r\033[K"  # Clear current line
+        echo -e "${YELLOW}Warning: Timeout while getting info for $(basename "$device") - skipping${NC}"
       fi
       
+      echo -n "- Checking safety..."
       safety_info_cache["$device"]=$(run_with_timeout $timeout_seconds get_safety_level "$device")
       if [[ "${safety_info_cache[$device]}" == "TIMEOUT" ]]; then
         safety_info_cache["$device"]="CAUTION|Device access timed out"
-        echo -e "\n${YELLOW}Warning: Timeout while checking safety for $device${NC}"
+        echo -ne "\r\033[K"  # Clear current line
+        echo -e "${YELLOW}Warning: Timeout while checking safety for $(basename "$device") - marking as CAUTION${NC}"
       fi
     else
-      # For Linux, use the standard approach
+      echo -n "- Getting info..."
       drive_info_cache["$device"]=$(get_drive_info "$device")
+      
+      echo -n "- Checking safety..."
       safety_info_cache["$device"]=$(get_safety_level "$device")
     fi
     
-    # Provide visual feedback for each drive processed
-    echo -ne "\r\033[K" # Clear current line
+    # Clear progress line
+    echo -ne "\r\033[K"
   done
   
   echo -e "\r\033[K${GREEN}Drive information loaded successfully.${NC}"
@@ -647,6 +699,7 @@ confirm_selection() {
   local drives=("$@")
   local has_dangerous=false
   local has_caution=false
+  local timeout_seconds=10
   
   # Initialize caches if not already done
   declare -A confirm_drive_cache
@@ -658,27 +711,52 @@ confirm_selection() {
   echo -e "${RED}You have selected the following drives for DOD 5220.22-M wiping:${NC}"
   echo
 
-  # First gather all drive info with timeout protection
+  # First gather all drive info with timeout protection and better progress feedback
   echo -e "${BLUE}Gathering final drive information...${NC}"
+  local total_drives=${#drives[@]}
   
-  for drive in "${drives[@]}"; do
+  for i in "${!drives[@]}"; do
+    local drive="${drives[$i]}"
+    local percent=$((100 * (i+1) / total_drives))
+    local drive_number=$((i + 1))
+    
+    # Show detailed progress indicator
+    printf "\r[%-50s] %3d%% | Drive %d/%d: %s" \
+           "$(printf '#%.0s' $(seq 1 $((50 * (i+1) / total_drives))))" \
+           "$percent" "$drive_number" "$total_drives" "$(basename "$drive")"
+    
     if [[ "$(uname)" == "Darwin" ]]; then
-      confirm_drive_cache["$drive"]=$(run_with_timeout 10 get_drive_info "$drive")
+      # Use the improved run_with_timeout function
+      confirm_drive_cache["$drive"]=$(run_with_timeout $timeout_seconds get_drive_info "$drive")
       if [[ "${confirm_drive_cache[$drive]}" == "TIMEOUT" ]]; then
-        confirm_drive_cache["$drive"]="Unknown|Unknown|Unknown|Unknown|Unknown"
+        echo -e "\n${YELLOW}Warning: Timeout while getting info for $(basename "$drive") - using cached or default values${NC}"
+        # Try to use previously cached info if available, otherwise use default
+        if [[ -n "${drive_info_cache[$drive]}" && "${drive_info_cache[$drive]}" != "Unknown|Unknown|Unknown|Unknown|Unknown" ]]; then
+          confirm_drive_cache["$drive"]="${drive_info_cache[$drive]}"
+        else
+          confirm_drive_cache["$drive"]="Unknown|Unknown|Unknown|Unknown|Unknown"
+        fi
       fi
       
-      confirm_safety_cache["$drive"]=$(run_with_timeout 10 get_safety_level "$drive")
+      confirm_safety_cache["$drive"]=$(run_with_timeout $timeout_seconds get_safety_level "$drive")
       if [[ "${confirm_safety_cache[$drive]}" == "TIMEOUT" ]]; then
-        confirm_safety_cache["$drive"]="CAUTION|Device access timed out"
+        echo -e "\n${YELLOW}Warning: Timeout while checking safety for $(basename "$drive") - marking as CAUTION${NC}"
+        # Try to use previously cached info if available, otherwise use default
+        if [[ -n "${safety_info_cache[$drive]}" && "${safety_info_cache[$drive]}" != "CAUTION|Device access timed out" ]]; then
+          confirm_safety_cache["$drive"]="${safety_info_cache[$drive]}"
+        else
+          confirm_safety_cache["$drive"]="CAUTION|Device access timed out"
+        fi
       fi
     else
       confirm_drive_cache["$drive"]=$(get_drive_info "$drive")
       confirm_safety_cache["$drive"]=$(get_safety_level "$drive")
     fi
-    echo -n "."
   done
-  echo -e "\n"
+  
+  # Clear progress line
+  echo -ne "\r\033[K"
+  echo -e "${GREEN}Drive information gathered successfully.${NC}\n"
   
   for drive in "${drives[@]}"; do
     local info="${confirm_drive_cache[$drive]}"
@@ -940,15 +1018,35 @@ run_with_timeout() {
   # Create a temp file for the result
   local tmpfile=$(mktemp)
   
-  # Run the command in background
-  (eval "$command $args" > "$tmpfile" 2>/dev/null) &
+  # Create a flag file to track if command has finished
+  local flagfile=$(mktemp)
+  
+  # Run the command in background with better error handling
+  (
+    # Try to execute the command and capture output
+    if eval "$command $args" > "$tmpfile" 2>/dev/null; then
+      # Command succeeded - mark as done
+      echo "DONE" > "$flagfile"
+    else
+      # Command failed - mark with error
+      echo "ERROR" > "$flagfile"
+    fi
+  ) &
   local pid=$!
   
-  # Wait for command to complete or timeout
+  # Wait for completion or timeout with visual feedback
   local count=0
   while kill -0 $pid 2>/dev/null && [ $count -lt $timeout ]; do
+    if [[ $count -gt 0 && $(($count % 3)) -eq 0 ]]; then
+      echo -n "." # Show progress every few seconds
+    fi
     sleep 1
     ((count++))
+    
+    # Check if command has completed
+    if [[ -f "$flagfile" && -s "$flagfile" ]]; then
+      break
+    fi
   done
   
   # If still running after timeout, kill it
@@ -960,6 +1058,7 @@ run_with_timeout() {
   # Get the result
   local result=$(cat "$tmpfile")
   rm -f "$tmpfile"
+  rm -f "$flagfile"
   
   echo "$result"
 }
@@ -973,6 +1072,7 @@ main() {
 
   while true; do
     # Get all available drives
+    echo -e "${BLUE}Scanning for available drives...${NC}"
     mapfile -t all_drives < <(get_available_drives)
 
     if [[ ${#all_drives[@]} -eq 0 ]]; then
@@ -995,7 +1095,8 @@ main() {
 
     log "Found ${#all_drives[@]} drive(s): ${all_drives[*]}"
     
-    # Get user selection
+    # Get user selection - note: removed the "Processing drive safety information" message
+    # that might have been causing confusion or was in a previous version
     if selected_drives=$(get_user_selection "${all_drives[@]}"); then
       mapfile -t drives_to_wipe <<<"$selected_drives"
 
@@ -1023,7 +1124,7 @@ main() {
   declare -a wipe_processes=()
   
   # Ask if user wants staggered start to reduce system load
-  echo -n "Start wiping drives with a delay between each drive? (y/n): "
+  echo -n "Start wiping drives with a delay between each drive wipe? (y/n): "
   read -r staggered
   local delay=0
   if [[ "$staggered" == "y" || "$staggered" == "Y" ]]; then
