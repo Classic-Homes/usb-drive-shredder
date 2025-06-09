@@ -48,95 +48,88 @@ check_requirements() {
   fi
 }
 
-# Get list of removable drives
+# Get list of drives (removable first, then manual mode)
 get_drives() {
   local drives=()
+  local mode="$1" # "auto" or "manual"
 
   if [[ "$(uname)" == "Darwin" ]]; then
-    # macOS: Find external/USB drives with timeout protection
-    echo "  Checking macOS drives..." >&2
-
-    # Get device list first
+    # macOS: Find external/USB drives
     local device_list
-    if ! device_list=$(timeout 10 diskutil list 2>/dev/null | grep -E "^/dev/disk[0-9]+" | awk '{print $1}'); then
-      echo "  Warning: diskutil list timed out or failed" >&2
-      return 0
-    fi
-
-    echo "$device_list" | while read -r device; do
-      if [[ -n "$device" && "$device" =~ /dev/disk[0-9]+$ ]]; then
-        echo "    Checking $device..." >&2
-
-        # Skip if not readable
-        if [[ ! -r "$device" ]]; then
-          echo "      Not readable, skipping" >&2
-          continue
-        fi
-
-        # Get device info with timeout
-        local info
-        if info=$(timeout 5 diskutil info "$device" 2>/dev/null); then
-          if echo "$info" | grep -E "(Removable Media: +Yes|Protocol: +USB)" >/dev/null; then
-            echo "      Found removable/USB drive: $device" >&2
-            drives+=("$device")
+    if device_list=$(diskutil list 2>/dev/null | grep -E "^/dev/disk[0-9]+" | awk '{print $1}'); then
+      echo "$device_list" | while read -r device; do
+        if [[ -n "$device" && "$device" =~ /dev/disk[0-9]+$ ]]; then
+          if [[ -r "$device" ]]; then
+            if [[ "$mode" == "manual" ]]; then
+              echo "$device"
+            else
+              local info
+              if info=$(timeout 5 diskutil info "$device" 2>/dev/null); then
+                if echo "$info" | grep -E "(Removable Media: +Yes|Protocol: +USB)" >/dev/null; then
+                  echo "$device"
+                fi
+              fi
+            fi
           fi
-        else
-          echo "      Info check timed out, skipping" >&2
         fi
-      fi
-    done
+      done
+    fi
   else
-    # Linux: Find removable drives with better error handling
-    echo "  Checking Linux drives..." >&2
-
+    # Linux: Find drives
     local lsblk_output
-    if ! lsblk_output=$(timeout 10 lsblk -d -n -o NAME,MAJ:MIN,RM,SIZE,RO,TYPE 2>/dev/null); then
-      echo "  Warning: lsblk timed out or failed" >&2
-      return 0
-    fi
+    if lsblk_output=$(lsblk -d -n -o NAME,MAJ:MIN,RM,SIZE,RO,TYPE 2>/dev/null); then
+      echo "$lsblk_output" | while read -r line; do
+        if [[ -n "$line" ]]; then
+          local name=$(echo "$line" | awk '{print $1}')
+          local removable=$(echo "$line" | awk '{print $3}')
+          local type=$(echo "$line" | awk '{print $6}')
 
-    echo "$lsblk_output" | while read -r line; do
-      if [[ -n "$line" ]]; then
-        local name=$(echo "$line" | awk '{print $1}')
-        local removable=$(echo "$line" | awk '{print $3}')
-        local type=$(echo "$line" | awk '{print $6}')
-
-        echo "    Checking /dev/$name (type=$type, removable=$removable)..." >&2
-
-        if [[ "$type" == "disk" && "$removable" == "1" ]]; then
-          if [[ -r "/dev/$name" ]]; then
-            echo "      Found removable drive: /dev/$name" >&2
-            drives+=("/dev/$name")
-          else
-            echo "      Not readable, skipping" >&2
+          if [[ "$type" == "disk" ]]; then
+            if [[ "$mode" == "manual" ]]; then
+              # Manual mode: show all disk drives
+              echo "/dev/$name"
+            elif [[ "$removable" == "1" ]]; then
+              # Auto mode: only removable drives
+              echo "/dev/$name"
+            fi
           fi
         fi
-      fi
-    done
+      done
+    fi
   fi
-
-  printf '%s\n' "${drives[@]}"
 }
 
-# Get drive info
+# Get drive info with better USB detection
 get_drive_info() {
   local device="$1"
   local vendor="Unknown"
   local model="Unknown"
   local size="Unknown"
+  local connection="Unknown"
 
   if [[ "$(uname)" == "Darwin" ]]; then
     local info=$(diskutil info "$device" 2>/dev/null || echo "")
     vendor=$(echo "$info" | grep "Device / Media Name" | sed 's/.*: *//' | awk '{print $1}' || echo "Unknown")
     model=$(echo "$info" | grep "Device Model" | sed 's/.*: *//' || echo "Unknown")
     size=$(echo "$info" | grep "Disk Size" | sed 's/.*: *//' | awk '{print $1" "$2}' || echo "Unknown")
+    connection=$(echo "$info" | grep "Protocol" | sed 's/.*: *//' || echo "Unknown")
   else
     vendor=$(lsblk -d -no vendor "$device" 2>/dev/null | xargs || echo "Unknown")
     model=$(lsblk -d -no model "$device" 2>/dev/null | xargs || echo "Unknown")
     size=$(lsblk -d -no size "$device" 2>/dev/null || echo "Unknown")
+
+    # Check if it's USB connected
+    local device_name=$(basename "$device")
+    if udevadm info --query=property --name="$device" 2>/dev/null | grep -q "ID_BUS=usb"; then
+      connection="USB"
+    elif [[ -e "/sys/block/$device_name/removable" ]] && [[ "$(cat /sys/block/$device_name/removable 2>/dev/null)" == "1" ]]; then
+      connection="Removable"
+    else
+      connection="Internal"
+    fi
   fi
 
-  echo "$vendor|$model|$size"
+  echo "$vendor|$model|$size|$connection"
 }
 
 # Check if drive is safe to wipe
@@ -167,7 +160,7 @@ is_safe_drive() {
   return 0
 }
 
-# Display drives
+# Display drives with connection info
 display_drives() {
   local drives=("$@")
 
@@ -177,12 +170,8 @@ display_drives() {
   echo
 
   if [[ ${#drives[@]} -eq 0 ]]; then
-    echo -e "${YELLOW}No removable drives found.${NC}"
-    echo
-    echo "Make sure:"
-    echo "- USB drives are connected"
-    echo "- USB passthrough is enabled (if in VM)"
-    exit 0
+    echo -e "${YELLOW}No drives found.${NC}"
+    return 1
   fi
 
   for i in "${!drives[@]}"; do
@@ -191,15 +180,24 @@ display_drives() {
     local vendor=$(echo "$info" | cut -d'|' -f1)
     local model=$(echo "$info" | cut -d'|' -f2)
     local size=$(echo "$info" | cut -d'|' -f3)
+    local connection=$(echo "$info" | cut -d'|' -f4)
     local num=$((i + 1))
 
+    # Color code based on safety and connection type
     if is_safe_drive "$device"; then
-      echo -e "${GREEN}[$num]${NC} $device - $vendor $model ($size) ${GREEN}[SAFE]${NC}"
+      if [[ "$connection" == "USB" ]]; then
+        echo -e "${GREEN}[$num]${NC} $device - $vendor $model ($size) ${GREEN}[USB - SAFE]${NC}"
+      elif [[ "$connection" == "Removable" ]]; then
+        echo -e "${GREEN}[$num]${NC} $device - $vendor $model ($size) ${GREEN}[REMOVABLE - SAFE]${NC}"
+      else
+        echo -e "${YELLOW}[$num]${NC} $device - $vendor $model ($size) ${YELLOW}[INTERNAL - CAUTION]${NC}"
+      fi
     else
-      echo -e "${RED}[$num]${NC} $device - $vendor $model ($size) ${RED}[SYSTEM - SKIP]${NC}"
+      echo -e "${RED}[$num]${NC} $device - $vendor $model ($size) ${RED}[SYSTEM - DANGEROUS]${NC}"
     fi
   done
   echo
+  return 0
 }
 
 # Get user selection
@@ -278,7 +276,8 @@ confirm_wipe() {
     local vendor=$(echo "$info" | cut -d'|' -f1)
     local model=$(echo "$info" | cut -d'|' -f2)
     local size=$(echo "$info" | cut -d'|' -f3)
-    echo -e "  ${YELLOW}$drive${NC} - $vendor $model ($size)"
+    local connection=$(echo "$info" | cut -d'|' -f4)
+    echo -e "  ${YELLOW}$drive${NC} - $vendor $model ($size) [$connection]"
   done
 
   echo
@@ -393,91 +392,48 @@ main() {
 
   check_requirements
 
-  echo "Scanning for drives..."
-  echo "(This may take a few seconds on some systems)"
+  echo "Scanning for removable drives..."
+  mapfile -t drives < <(get_drives "auto")
 
-  # Get drives with timeout protection
-  local drives_output
-  if drives_output=$(timeout 30 bash -c 'get_drives() {
-        local drives=()
-        
-        if [[ "$(uname)" == "Darwin" ]]; then
-            # macOS: Find external/USB drives with timeout protection
-            echo "  Checking macOS drives..." >&2
-            
-            # Get device list first
-            local device_list
-            if ! device_list=$(timeout 10 diskutil list 2>/dev/null | grep -E "^/dev/disk[0-9]+" | awk "{print \$1}"); then
-                echo "  Warning: diskutil list timed out or failed" >&2
-                return 0
-            fi
-            
-            echo "$device_list" | while read -r device; do
-                if [[ -n "$device" && "$device" =~ /dev/disk[0-9]+$ ]]; then
-                    echo "    Checking $device..." >&2
-                    
-                    # Skip if not readable
-                    if [[ ! -r "$device" ]]; then
-                        echo "      Not readable, skipping" >&2
-                        continue
-                    fi
-                    
-                    # Get device info with timeout
-                    local info
-                    if info=$(timeout 5 diskutil info "$device" 2>/dev/null); then
-                        if echo "$info" | grep -E "(Removable Media: +Yes|Protocol: +USB)" >/dev/null; then
-                            echo "      Found removable/USB drive: $device" >&2
-                            echo "$device"
-                        fi
-                    else
-                        echo "      Info check timed out, skipping" >&2
-                    fi
-                fi
-            done
-        else
-            # Linux: Find removable drives with better error handling
-            echo "  Checking Linux drives..." >&2
-            
-            local lsblk_output
-            if ! lsblk_output=$(timeout 10 lsblk -d -n -o NAME,MAJ:MIN,RM,SIZE,RO,TYPE 2>/dev/null); then
-                echo "  Warning: lsblk timed out or failed" >&2
-                return 0
-            fi
-            
-            echo "$lsblk_output" | while read -r line; do
-                if [[ -n "$line" ]]; then
-                    local name=$(echo "$line" | awk "{print \$1}")
-                    local removable=$(echo "$line" | awk "{print \$3}")
-                    local type=$(echo "$line" | awk "{print \$6}")
-                    
-                    echo "    Checking /dev/$name (type=$type, removable=$removable)..." >&2
-                    
-                    if [[ "$type" == "disk" && "$removable" == "1" ]]; then
-                        if [[ -r "/dev/$name" ]]; then
-                            echo "      Found removable drive: /dev/$name" >&2
-                            echo "/dev/$name"
-                        else
-                            echo "      Not readable, skipping" >&2
-                        fi
-                    fi
-                fi
-            done
-        fi
-    }; get_drives' 2>&1); then
-    # Extract just the device paths from the output
-    mapfile -t drives < <(echo "$drives_output" | grep "^/dev/" || true)
-  else
-    echo -e "${RED}Error: Drive scanning timed out after 30 seconds${NC}"
-    echo "This might indicate:"
-    echo "- Slow disk access (VM or hardware issue)"
-    echo "- Permission problems"
-    echo "- System overload"
+  if [[ ${#drives[@]} -eq 0 ]]; then
+    echo -e "${YELLOW}No removable drives found automatically.${NC}"
     echo
-    echo "Try running the debug script: sudo bash drive_debug.sh"
-    exit 1
+    echo "This could mean:"
+    echo "- No USB drives are connected"
+    echo "- USB drives appear as internal (common with adapters/VMs)"
+    echo "- USB passthrough issues in VM"
+    echo
+    echo -n "Would you like to see ALL disk drives for manual selection? (y/N): "
+    read -r manual_mode
+
+    if [[ "$manual_mode" =~ ^[Yy]$ ]]; then
+      echo "Scanning all disk drives..."
+      mapfile -t drives < <(get_drives "manual")
+
+      if [[ ${#drives[@]} -eq 0 ]]; then
+        echo -e "${RED}No disk drives found at all!${NC}"
+        echo "Check if running as root: sudo $0"
+        exit 1
+      fi
+
+      echo -e "${BOLD}${RED}MANUAL MODE - BE VERY CAREFUL!${NC}"
+      echo -e "${RED}You will see ALL disk drives including system drives.${NC}"
+      echo -e "${RED}Double-check your selections!${NC}"
+      echo
+      echo "Press Enter to continue..."
+      read -r
+    else
+      echo "Exiting. Make sure USB drives are properly connected."
+      exit 0
+    fi
   fi
 
   # Get user selection
+  if ! display_drives "${drives[@]}"; then
+    echo "No drives available for selection."
+    exit 1
+  fi
+
   mapfile -t selected < <(get_selection "${drives[@]}")
 
   # Confirm
