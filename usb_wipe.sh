@@ -115,25 +115,31 @@ get_all_drives_detailed() {
     fi
 
     # Safety analysis
+    echo "DEBUG: Starting safety analysis for $device" >&2
     local warning_flags=""
     local safety_level="SAFE"
     local safety_reasons=()
 
     # Check if device is the Ubuntu system drive
+    echo "DEBUG: Checking if $device is system drive" >&2
     if is_system_drive "/dev/$device"; then
+      echo "DEBUG: $device is system drive" >&2
       warning_flags+="[SYSTEM-DRIVE] "
       safety_level="DANGEROUS"
       safety_reasons+=("Contains Ubuntu system partitions")
     fi
 
     # Check if device is mounted to important directories
+    echo "DEBUG: Checking system mounts for $device" >&2
     if mount | grep "/dev/$device" | grep -E "(/ |/boot |/home |/usr |/var |/opt )"; then
+      echo "DEBUG: $device has system mounts" >&2
       warning_flags+="[SYSTEM-MOUNT] "
       safety_level="DANGEROUS"
       safety_reasons+=("Mounted to system directories")
     fi
 
     # Check if device is currently mounted (any partition)
+    echo "DEBUG: Checking general mounts for $device" >&2
     local mount_info=""
     if mount | grep -q "/dev/$device"; then
       if [[ "$safety_level" != "DANGEROUS" ]]; then
@@ -143,6 +149,8 @@ get_all_drives_detailed() {
         safety_reasons+=("Currently mounted at: $mount_info")
       fi
     fi
+
+    echo "DEBUG: Checking Ubuntu media for $device" >&2
 
     # Check if device appears to be Ubuntu installation media
     if udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep -q "ID_FS_LABEL.*[Uu]buntu"; then
@@ -212,7 +220,9 @@ get_all_drives_detailed() {
     fi
 
     # Store drive information: vendor|model|size|serial|bus_type|connection_type|warning_flags|safety_level|reasons
+    echo "DEBUG: Storing info for $device" >&2
     drives_info["/dev/$device"]="$vendor|$model|$size|$serial|$bus_type|$connection_type|$warning_flags|$safety_level|$reasons_str"
+    echo "DEBUG: Stored info for $device" >&2
 
   done < <(lsblk -d -n -o NAME,SIZE,TYPE)
 
