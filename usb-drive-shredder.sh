@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# USB Drive DOD 5220.22-M Wipe Script with Interactive UI
-# Safely identifies and wipes USB-connected drives concurrently
-# Ubuntu VM environment with safeguards against system drives
+# Drive DOD 5220.22-M Wipe Script with Manual Selection
+# Displays all available drives and allows manual selection
+# Ubuntu VM environment with comprehensive safety warnings
 
 set -euo pipefail
 
@@ -16,7 +16,7 @@ BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 # Log file
-LOGFILE="/tmp/usb_wipe_$(date +%Y%m%d_%H%M%S).log"
+LOGFILE="/tmp/drive_wipe_$(date +%Y%m%d_%H%M%S).log"
 
 log() {
   echo -e "$1" | tee -a "$LOGFILE"
@@ -48,8 +48,8 @@ fi
 show_header() {
   clear
   echo -e "${BOLD}${CYAN}=================================================${NC}"
-  echo -e "${BOLD}${CYAN}    USB Drive DOD 5220.22-M Wipe Utility${NC}"
-  echo -e "${BOLD}${CYAN}         Ubuntu VM Environment${NC}"
+  echo -e "${BOLD}${CYAN}    Drive DOD 5220.22-M Wipe Utility${NC}"
+  echo -e "${BOLD}${CYAN}         Manual Drive Selection${NC}"
   echo -e "${BOLD}${CYAN}=================================================${NC}"
   echo
 }
@@ -76,66 +76,8 @@ is_system_drive() {
   return 1 # Not system drive
 }
 
-# Function to check if a device is USB-connected (with fallback methods)
-is_usb_device() {
-  local device="$1"
-  local device_name=$(basename "$device")
-
-  # Method 1: Check udev properties for USB bus
-  if udevadm info --query=property --name="$device" 2>/dev/null | grep -q "ID_BUS=usb"; then
-    return 0
-  fi
-
-  # Method 2: Check for USB in device path (most reliable for USB-SATA bridges)
-  local device_path=$(udevadm info --query=path --name="$device" 2>/dev/null)
-  if [[ "$device_path" =~ /usb[0-9]+/ ]]; then
-    return 0
-  fi
-
-  # Method 3: Check if device vendor/model contains USB indicators or known USB bridge names
-  local vendor=$(udevadm info --query=property --name="$device" 2>/dev/null | grep "ID_VENDOR=" | cut -d'=' -f2 || echo "")
-  local model=$(udevadm info --query=property --name="$device" 2>/dev/null | grep "ID_MODEL=" | cut -d'=' -f2 || echo "")
-
-  # Check for USB keywords or known USB bridge devices
-  if [[ "$vendor" =~ [Uu][Ss][Bb] ]] || [[ "$model" =~ [Uu][Ss][Bb] ]] || [[ "$model" =~ Bridge ]]; then
-    return 0
-  fi
-
-  # Method 4: Check alternative vendor/model from /sys if udev didn't provide them
-  if [[ "$vendor" == "" ]] && [[ "$model" == "" ]]; then
-    vendor=$(cat "/sys/block/$device_name/device/vendor" 2>/dev/null | tr -d ' ' || echo "")
-    model=$(cat "/sys/block/$device_name/device/model" 2>/dev/null | tr -d ' ' || echo "")
-
-    if [[ "$vendor" =~ [Uu][Ss][Bb] ]] || [[ "$model" =~ [Uu][Ss][Bb] ]] || [[ "$model" =~ Bridge ]]; then
-      return 0
-    fi
-  fi
-
-  # Method 5: For Proxmox passthrough, check if device is not sda (usually the system drive)
-  # and appears to be a removable/external device
-  if [[ "$device_name" != "sda" ]]; then
-    # Check if device is removable
-    local removable=$(cat "/sys/block/$device_name/removable" 2>/dev/null || echo "0")
-    if [[ "$removable" == "1" ]]; then
-      return 0
-    fi
-
-    # In Proxmox passthrough scenarios, USB drives might appear as regular SCSI devices
-    # Check if this is likely a non-system drive
-    local size_bytes=$(blockdev --getsize64 "$device" 2>/dev/null || echo "0")
-
-    # If it's not the first drive (sda) and has characteristics of external storage
-    # we'll consider it potentially USB (user can still exclude via safety checks)
-    if [[ $size_bytes -gt 1073741824 ]]; then # Larger than 1GB
-      return 0
-    fi
-  fi
-
-  return 1 # Not detected as USB
-}
-
-# Function to get USB drives with detailed info
-get_usb_drives_detailed() {
+# Function to get all drives with detailed info and safety analysis
+get_all_drives_detailed() {
   local -A drives_info
 
   # Get all block devices
@@ -147,89 +89,120 @@ get_usb_drives_detailed() {
     # Skip if not a disk or if it's a partition
     [[ "$type" != "disk" ]] && continue
 
-    # Check if device is USB connected (with multiple detection methods)
-    if is_usb_device "/dev/$device"; then
-      # Get detailed device information
-      local vendor=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_VENDOR=" | cut -d'=' -f2 || echo "Unknown")
-      local model=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_MODEL=" | cut -d'=' -f2 || echo "Unknown")
-      local serial=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_SERIAL_SHORT=" | cut -d'=' -f2 || echo "Unknown")
-      local size_bytes=$(blockdev --getsize64 "/dev/$device" 2>/dev/null || echo "0")
+    # Get detailed device information
+    local vendor=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_VENDOR=" | cut -d'=' -f2 || echo "Unknown")
+    local model=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_MODEL=" | cut -d'=' -f2 || echo "Unknown")
+    local serial=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_SERIAL_SHORT=" | cut -d'=' -f2 || echo "Unknown")
+    local bus_type=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_BUS=" | cut -d'=' -f2 || echo "Unknown")
+    local device_path=$(udevadm info --query=path --name="/dev/$device" 2>/dev/null || echo "Unknown")
+    local size_bytes=$(blockdev --getsize64 "/dev/$device" 2>/dev/null || echo "0")
 
-      # If vendor/model are unknown, try alternative methods
-      if [[ "$vendor" == "Unknown" ]] && [[ "$model" == "Unknown" ]]; then
-        # Try to get info from /sys
-        vendor=$(cat "/sys/block/$device/device/vendor" 2>/dev/null | tr -d ' ' || echo "Unknown")
-        model=$(cat "/sys/block/$device/device/model" 2>/dev/null | tr -d ' ' || echo "Unknown")
-      fi
-
-      # Safety checks
-      local warning_flags=""
-      local is_safe=true
-
-      # Check if device is the Ubuntu system drive
-      if is_system_drive "/dev/$device"; then
-        warning_flags+="[SYSTEM-DRIVE] "
-        is_safe=false
-      fi
-
-      # Check if device is mounted to important directories
-      if mount | grep "/dev/$device" | grep -E "(/ |/boot |/home |/usr |/var |/opt )"; then
-        warning_flags+="[SYSTEM-MOUNT] "
-        is_safe=false
-      fi
-
-      # Check if device is currently mounted (any partition)
-      if mount | grep -q "/dev/$device"; then
-        # Only flag as unsafe if not already flagged as system
-        if [[ "$warning_flags" != *"SYSTEM"* ]]; then
-          warning_flags+="[MOUNTED] "
-          # Don't mark as unsafe for regular mounts - user might want to wipe mounted USB drives
-        fi
-      fi
-
-      # Check if device appears to be Ubuntu installation media
-      if udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep -q "ID_FS_LABEL.*[Uu]buntu"; then
-        warning_flags+="[UBUNTU-MEDIA] "
-        is_safe=false
-      fi
-
-      # Check for very small devices (< 100MB, likely boot media or system devices)
-      if [[ $size_bytes -lt 104857600 ]]; then
-        warning_flags+="[TOO-SMALL] "
-        is_safe=false
-      fi
-
-      # Check if device has swap partitions
-      if lsblk -n -o FSTYPE "/dev/$device" 2>/dev/null | grep -q "swap"; then
-        warning_flags+="[HAS-SWAP] "
-        is_safe=false
-      fi
-
-      # Additional safety check: exclude devices with Linux filesystem signatures on main device
-      local fstype=$(lsblk -n -o FSTYPE "/dev/$device" 2>/dev/null | head -1)
-      if [[ "$fstype" =~ ^(ext[2-4]|xfs|btrfs)$ ]]; then
-        warning_flags+="[LINUX-FS] "
-        is_safe=false
-      fi
-
-      # Check if device contains LVM or RAID signatures
-      if udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep -E "(LVM|MD_|RAID)"; then
-        warning_flags+="[LVM-RAID] "
-        is_safe=false
-      fi
-
-      # Additional safety for sda - always mark as unsafe unless explicitly USB
-      if [[ "$device" == "sda" ]]; then
-        # Double-check if this is really USB and not the system drive
-        if ! udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep -q "ID_BUS=usb"; then
-          warning_flags+="[LIKELY-SYSTEM] "
-          is_safe=false
-        fi
-      fi
-
-      # Store drive information
-      drives_info["/dev/$device"]="$vendor|$model|$size|$serial|$warning_flags|$is_safe"
+    # If vendor/model are unknown, try alternative methods
+    if [[ "$vendor" == "Unknown" ]] && [[ "$model" == "Unknown" ]]; then
+      vendor=$(cat "/sys/block/$device/device/vendor" 2>/dev/null | tr -d ' ' || echo "Unknown")
+      model=$(cat "/sys/block/$device/device/model" 2>/dev/null | tr -d ' ' || echo "Unknown")
     fi
+
+    # Safety analysis
+    local warning_flags=""
+    local safety_level="SAFE"
+    local safety_reasons=()
+
+    # Check if device is the Ubuntu system drive
+    if is_system_drive "/dev/$device"; then
+      warning_flags+="[SYSTEM-DRIVE] "
+      safety_level="DANGEROUS"
+      safety_reasons+=("Contains Ubuntu system partitions")
+    fi
+
+    # Check if device is mounted to important directories
+    if mount | grep "/dev/$device" | grep -E "(/ |/boot |/home |/usr |/var |/opt )"; then
+      warning_flags+="[SYSTEM-MOUNT] "
+      safety_level="DANGEROUS"
+      safety_reasons+=("Mounted to system directories")
+    fi
+
+    # Check if device is currently mounted (any partition)
+    local mount_info=""
+    if mount | grep -q "/dev/$device"; then
+      if [[ "$safety_level" != "DANGEROUS" ]]; then
+        warning_flags+="[MOUNTED] "
+        safety_level="CAUTION"
+        mount_info=$(mount | grep "/dev/$device" | awk '{print $3}' | tr '\n' ' ')
+        safety_reasons+=("Currently mounted at: $mount_info")
+      fi
+    fi
+
+    # Check if device appears to be Ubuntu installation media
+    if udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep -q "ID_FS_LABEL.*[Uu]buntu"; then
+      warning_flags+="[UBUNTU-MEDIA] "
+      safety_level="DANGEROUS"
+      safety_reasons+=("Ubuntu installation media")
+    fi
+
+    # Check for very small devices (< 100MB, likely system devices)
+    if [[ $size_bytes -lt 104857600 ]]; then
+      warning_flags+="[TOO-SMALL] "
+      safety_level="DANGEROUS"
+      safety_reasons+=("Very small device (< 100MB)")
+    fi
+
+    # Check if device has swap partitions
+    if lsblk -n -o FSTYPE "/dev/$device" 2>/dev/null | grep -q "swap"; then
+      warning_flags+="[HAS-SWAP] "
+      safety_level="DANGEROUS"
+      safety_reasons+=("Contains swap partition")
+    fi
+
+    # Check for Linux filesystem signatures on main device
+    local fstype=$(lsblk -n -o FSTYPE "/dev/$device" 2>/dev/null | head -1)
+    if [[ "$fstype" =~ ^(ext[2-4]|xfs|btrfs)$ ]]; then
+      warning_flags+="[LINUX-FS] "
+      if [[ "$safety_level" == "SAFE" ]]; then
+        safety_level="CAUTION"
+      fi
+      safety_reasons+=("Contains Linux filesystem ($fstype)")
+    fi
+
+    # Check if device contains LVM or RAID signatures
+    if udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep -E "(LVM|MD_|RAID)"; then
+      warning_flags+="[LVM-RAID] "
+      safety_level="DANGEROUS"
+      safety_reasons+=("Contains LVM/RAID configuration")
+    fi
+
+    # Special handling for sda (usually system drive)
+    if [[ "$device" == "sda" ]] && [[ "$safety_level" == "SAFE" ]]; then
+      safety_level="CAUTION"
+      safety_reasons+=("First drive (sda) - typically system drive")
+    fi
+
+    # Determine connection type from bus and path
+    local connection_type="Unknown"
+    if [[ "$bus_type" == "usb" ]]; then
+      connection_type="USB"
+    elif [[ "$device_path" =~ /usb[0-9]+/ ]]; then
+      connection_type="USB (via bridge)"
+    elif [[ "$bus_type" == "ata" ]]; then
+      connection_type="SATA/ATA"
+    elif [[ "$bus_type" == "scsi" ]]; then
+      connection_type="SCSI"
+    elif [[ "$bus_type" == "nvme" ]]; then
+      connection_type="NVMe"
+    fi
+
+    # Join safety reasons
+    local reasons_str=""
+    if [[ ${#safety_reasons[@]} -gt 0 ]]; then
+      reasons_str=$(
+        IFS="; "
+        echo "${safety_reasons[*]}"
+      )
+    fi
+
+    # Store drive information: vendor|model|size|serial|bus_type|connection_type|warning_flags|safety_level|reasons
+    drives_info["/dev/$device"]="$vendor|$model|$size|$serial|$bus_type|$connection_type|$warning_flags|$safety_level|$reasons_str"
+
   done < <(lsblk -d -n -o NAME,SIZE,TYPE)
 
   # Return the associative array as key-value pairs
@@ -245,7 +218,7 @@ display_drive_menu() {
 
   if [[ $drive_count -eq 0 ]]; then
     echo
-    warning "No USB drives found!"
+    warning "No drives found!"
     echo
     echo "Press Enter to exit..."
     read -r
@@ -253,7 +226,7 @@ display_drive_menu() {
   fi
 
   show_header
-  echo -e "${BOLD}Found $drive_count USB drive(s):${NC}"
+  echo -e "${BOLD}Found $drive_count drive(s):${NC}"
   echo
 
   # Display drives with numbers
@@ -264,38 +237,48 @@ display_drive_menu() {
     local model=$(echo "$info" | cut -d'|' -f2)
     local size=$(echo "$info" | cut -d'|' -f3)
     local serial=$(echo "$info" | cut -d'|' -f4)
-    local warnings=$(echo "$info" | cut -d'|' -f5)
-    local is_safe=$(echo "$info" | cut -d'|' -f6)
+    local bus_type=$(echo "$info" | cut -d'|' -f5)
+    local connection_type=$(echo "$info" | cut -d'|' -f6)
+    local warnings=$(echo "$info" | cut -d'|' -f7)
+    local safety_level=$(echo "$info" | cut -d'|' -f8)
+    local reasons=$(echo "$info" | cut -d'|' -f9)
 
     local num=$((i + 1))
 
-    if [[ "$is_safe" == "true" ]]; then
-      echo -e "${GREEN}[$num]${NC} $device"
-    else
-      echo -e "${RED}[$num]${NC} $device ${RED}$warnings${NC}"
-    fi
+    # Color-code based on safety level
+    case "$safety_level" in
+    "SAFE")
+      echo -e "${GREEN}[$num]${NC} $device ${GREEN}[SAFE]${NC}"
+      ;;
+    "CAUTION")
+      echo -e "${YELLOW}[$num]${NC} $device ${YELLOW}[CAUTION]${NC}"
+      ;;
+    "DANGEROUS")
+      echo -e "${RED}[$num]${NC} $device ${RED}[DANGEROUS]${NC}"
+      ;;
+    esac
 
     echo "    Vendor: $vendor"
     echo "    Model:  $model"
     echo "    Size:   $size"
     echo "    Serial: $serial"
+    echo "    Bus:    $bus_type"
+    echo "    Type:   $connection_type"
 
-    if [[ "$is_safe" == "false" ]]; then
-      echo -e "    ${RED}Status: UNSAFE - Protected from wiping${NC}"
-      case "$warnings" in
-      *"SYSTEM-DRIVE"*) echo -e "    ${RED}Reason: Ubuntu system drive${NC}" ;;
-      *"SYSTEM-MOUNT"*) echo -e "    ${RED}Reason: Contains system mount points${NC}" ;;
-      *"UBUNTU-MEDIA"*) echo -e "    ${RED}Reason: Ubuntu installation media${NC}" ;;
-      *"LINUX-FS"*) echo -e "    ${RED}Reason: Contains Linux filesystem${NC}" ;;
-      *"LVM-RAID"*) echo -e "    ${RED}Reason: Contains LVM/RAID configuration${NC}" ;;
-      *"HAS-SWAP"*) echo -e "    ${RED}Reason: Contains swap partition${NC}" ;;
-      *"TOO-SMALL"*) echo -e "    ${RED}Reason: Device too small (< 100MB)${NC}" ;;
+    if [[ -n "$reasons" ]]; then
+      case "$safety_level" in
+      "SAFE")
+        echo -e "    ${GREEN}Status: Safe for wiping${NC}"
+        ;;
+      "CAUTION")
+        echo -e "    ${YELLOW}Status: Use caution - $reasons${NC}"
+        ;;
+      "DANGEROUS")
+        echo -e "    ${RED}Status: DANGEROUS - $reasons${NC}"
+        ;;
       esac
     else
       echo -e "    ${GREEN}Status: Safe for wiping${NC}"
-      if [[ "$warnings" == *"MOUNTED"* ]]; then
-        echo -e "    ${YELLOW}Note: Device is currently mounted${NC}"
-      fi
     fi
     echo
   done
@@ -311,9 +294,12 @@ get_user_selection() {
 
     echo -e "${BOLD}Selection Options:${NC}"
     echo "  Enter drive numbers separated by spaces (e.g., 1 3 5)"
-    echo "  Type 'all' to select all safe drives"
+    echo "  Type 'all-safe' to select all SAFE drives only"
+    echo "  Type 'all-non-dangerous' to select SAFE and CAUTION drives"
     echo "  Type 'quit' or 'q' to exit"
     echo "  Type 'refresh' or 'r' to rescan drives"
+    echo
+    echo -e "${YELLOW}Note: DANGEROUS drives can still be selected but require extra confirmation${NC}"
     echo
     echo -n "Your selection: "
 
@@ -329,13 +315,13 @@ get_user_selection() {
       sleep 1
       return 2 # Signal to refresh
       ;;
-    "all")
+    "all-safe")
       # Select all safe drives
       selected_drives=()
       for i in "${!drives[@]}"; do
         local info=$(echo "${drives[$i]}" | cut -d':' -f2)
-        local is_safe=$(echo "$info" | cut -d'|' -f6)
-        if [[ "$is_safe" == "true" ]]; then
+        local safety_level=$(echo "$info" | cut -d'|' -f8)
+        if [[ "$safety_level" == "SAFE" ]]; then
           local device=$(echo "${drives[$i]}" | cut -d':' -f1)
           selected_drives+=("$device")
         fi
@@ -343,7 +329,28 @@ get_user_selection() {
 
       if [[ ${#selected_drives[@]} -eq 0 ]]; then
         echo
-        warning "No safe drives available for selection!"
+        warning "No SAFE drives available for selection!"
+        echo "Press Enter to continue..."
+        read -r
+        continue
+      fi
+      break
+      ;;
+    "all-non-dangerous")
+      # Select all safe and caution drives
+      selected_drives=()
+      for i in "${!drives[@]}"; do
+        local info=$(echo "${drives[$i]}" | cut -d':' -f2)
+        local safety_level=$(echo "$info" | cut -d'|' -f8)
+        if [[ "$safety_level" == "SAFE" ]] || [[ "$safety_level" == "CAUTION" ]]; then
+          local device=$(echo "${drives[$i]}" | cut -d':' -f1)
+          selected_drives+=("$device")
+        fi
+      done
+
+      if [[ ${#selected_drives[@]} -eq 0 ]]; then
+        echo
+        warning "No non-dangerous drives available for selection!"
         echo "Press Enter to continue..."
         read -r
         continue
@@ -369,16 +376,7 @@ get_user_selection() {
           break
         fi
 
-        # Check if drive is safe
-        local info=$(echo "${drives[$index]}" | cut -d':' -f2)
-        local is_safe=$(echo "$info" | cut -d'|' -f6)
         local device=$(echo "${drives[$index]}" | cut -d':' -f1)
-
-        if [[ "$is_safe" == "false" ]]; then
-          warning "Drive $num ($device) is marked as unsafe and cannot be selected"
-          valid_selection=false
-          break
-        fi
 
         # Check for duplicates
         if [[ " ${selected_drives[*]} " =~ " $device " ]]; then
@@ -412,9 +410,24 @@ get_user_selection() {
   return 0
 }
 
-# Function to confirm selection
+# Function to confirm selection with extra checks for dangerous drives
 confirm_wipe() {
   local drives=("$@")
+  local has_dangerous=false
+  local has_caution=false
+
+  # Check safety levels of selected drives
+  for drive in "${drives[@]}"; do
+    local drive_info=$(get_all_drives_detailed | grep "^$drive:")
+    local info=$(echo "$drive_info" | cut -d':' -f2)
+    local safety_level=$(echo "$info" | cut -d'|' -f8)
+
+    if [[ "$safety_level" == "DANGEROUS" ]]; then
+      has_dangerous=true
+    elif [[ "$safety_level" == "CAUTION" ]]; then
+      has_caution=true
+    fi
+  done
 
   show_header
   echo -e "${BOLD}${RED}FINAL CONFIRMATION${NC}"
@@ -423,35 +436,95 @@ confirm_wipe() {
   echo
 
   for drive in "${drives[@]}"; do
-    echo -e "  ${RED}$drive${NC}"
+    local drive_info=$(get_all_drives_detailed | grep "^$drive:")
+    local info=$(echo "$drive_info" | cut -d':' -f2)
+    local vendor=$(echo "$info" | cut -d'|' -f1)
+    local model=$(echo "$info" | cut -d'|' -f2)
+    local size=$(echo "$info" | cut -d'|' -f3)
+    local safety_level=$(echo "$info" | cut -d'|' -f8)
+    local reasons=$(echo "$info" | cut -d'|' -f9)
 
-    # Get and display drive info
-    local vendor=$(udevadm info --query=property --name="$drive" 2>/dev/null | grep "ID_VENDOR=" | cut -d'=' -f2 || echo "Unknown")
-    local model=$(udevadm info --query=property --name="$drive" 2>/dev/null | grep "ID_MODEL=" | cut -d'=' -f2 || echo "Unknown")
-    local size=$(lsblk -d -n -o SIZE "$drive" 2>/dev/null || echo "Unknown")
-
-    echo "    $vendor $model ($size)"
+    case "$safety_level" in
+    "SAFE")
+      echo -e "  ${GREEN}$drive${NC} - $vendor $model ($size) ${GREEN}[SAFE]${NC}"
+      ;;
+    "CAUTION")
+      echo -e "  ${YELLOW}$drive${NC} - $vendor $model ($size) ${YELLOW}[CAUTION]${NC}"
+      if [[ -n "$reasons" ]]; then
+        echo -e "    ${YELLOW}⚠ $reasons${NC}"
+      fi
+      ;;
+    "DANGEROUS")
+      echo -e "  ${RED}$drive${NC} - $vendor $model ($size) ${RED}[DANGEROUS]${NC}"
+      if [[ -n "$reasons" ]]; then
+        echo -e "    ${RED}⚠ $reasons${NC}"
+      fi
+      ;;
+    esac
   done
 
   echo
   echo -e "${RED}${BOLD}WARNING: This operation will PERMANENTLY DESTROY all data on these drives!${NC}"
   echo -e "${RED}${BOLD}This action CANNOT be undone!${NC}"
   echo
-  echo "To proceed, type exactly: I UNDERSTAND AND WANT TO WIPE THESE DRIVES"
-  echo "Or type anything else to cancel"
-  echo
-  echo -n "Confirmation: "
 
-  read -r confirmation
-
-  if [[ "$confirmation" == "I UNDERSTAND AND WANT TO WIPE THESE DRIVES" ]]; then
-    return 0
-  else
+  # Different confirmation levels based on danger
+  if [[ "$has_dangerous" == "true" ]]; then
+    echo -e "${RED}${BOLD}CRITICAL WARNING: You have selected DANGEROUS drives!${NC}"
+    echo -e "${RED}These may contain system files or important data!${NC}"
     echo
-    info "Operation cancelled"
-    echo "Press Enter to return to drive selection..."
-    read -r
-    return 1
+    echo "To proceed with DANGEROUS drives, type exactly:"
+    echo "'I UNDERSTAND THE RISKS AND WANT TO WIPE DANGEROUS DRIVES'"
+    echo
+    echo -n "Confirmation: "
+
+    read -r confirmation
+
+    if [[ "$confirmation" == "I UNDERSTAND THE RISKS AND WANT TO WIPE DANGEROUS DRIVES" ]]; then
+      return 0
+    else
+      echo
+      info "Operation cancelled - dangerous drives not confirmed"
+      echo "Press Enter to return to drive selection..."
+      read -r
+      return 1
+    fi
+  elif [[ "$has_caution" == "true" ]]; then
+    echo -e "${YELLOW}${BOLD}CAUTION: You have selected drives that require extra attention!${NC}"
+    echo
+    echo "To proceed, type exactly: 'I WANT TO WIPE THESE DRIVES'"
+    echo "Or type anything else to cancel"
+    echo
+    echo -n "Confirmation: "
+
+    read -r confirmation
+
+    if [[ "$confirmation" == "I WANT TO WIPE THESE DRIVES" ]]; then
+      return 0
+    else
+      echo
+      info "Operation cancelled"
+      echo "Press Enter to return to drive selection..."
+      read -r
+      return 1
+    fi
+  else
+    echo "To proceed with safe drives, type exactly: 'WIPE DRIVES'"
+    echo "Or type anything else to cancel"
+    echo
+    echo -n "Confirmation: "
+
+    read -r confirmation
+
+    if [[ "$confirmation" == "WIPE DRIVES" ]]; then
+      return 0
+    else
+      echo
+      info "Operation cancelled"
+      echo "Press Enter to return to drive selection..."
+      read -r
+      return 1
+    fi
   fi
 }
 
@@ -553,17 +626,17 @@ monitor_wipes() {
 
 # Main execution
 main() {
-  log "=== USB Drive DOD 5220.22-M Wipe Script Started ==="
+  log "=== Drive DOD 5220.22-M Wipe Script Started ==="
   log "Timestamp: $(date)"
   log "Log file: $LOGFILE"
 
   while true; do
-    # Get USB drives
-    mapfile -t drive_list < <(get_usb_drives_detailed)
+    # Get all drives
+    mapfile -t drive_list < <(get_all_drives_detailed)
 
     if [[ ${#drive_list[@]} -eq 0 ]]; then
       show_header
-      warning "No USB drives found!"
+      warning "No drives found!"
       echo
       echo "Press Enter to exit..."
       read -r
