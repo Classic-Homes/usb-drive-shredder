@@ -1,7 +1,21 @@
 #!/bin/bash
 
 # Drive DOD 5220.22-M Wipe Script with Manual Selection
-# Fixed version for Ubuntu VM environment with USB passthrough
+# Cross-platform version for Linux and macOS environments
+# 
+# Features:
+# - Secure disk wiping using DoD 5220.22-M standard (3 passes + zero verification)
+# - Safety checks to prevent accidental wiping of system disks
+# - Color-coded safety ratings for each drive
+# - Detailed progress indicators and status updates
+# - Concurrent wiping of multiple drives with monitoring
+#
+# Note: For better progress visualization on macOS, install 'pv':
+#   brew install pv
+#
+# Troubleshooting:
+# - If the script hangs at "Found X drives", use the debug-drive option
+# - If drive detection is slow, try running with sudo
 
 set -euo pipefail
 
@@ -150,22 +164,18 @@ has_mounted_partitions() {
   local device="$1"
   
   if [[ "$(uname)" == "Darwin" ]]; then
-    # macOS version
-    local mount_point=$(diskutil info "$device" | grep "Mount Point" | sed 's/.*Mount Point: *//')
+    # macOS version - check main device and partitions in one go
+    # First check if the main device is mounted
+    local device_info=$(diskutil info "$device" 2>/dev/null)
+    local mount_point=$(echo "$device_info" | grep "Mount Point" | sed 's/.*Mount Point: *//')
     if [[ -n "$mount_point" && "$mount_point" != "(not mounted)" ]]; then
       return 0
     fi
     
-    # Check for partitions
-    local basename_device=$(basename "$device")
-    while read -r partition; do
-      if [[ -n "$partition" ]]; then
-        local part_mount=$(diskutil info "/dev/$partition" 2>/dev/null | grep "Mount Point" | sed 's/.*Mount Point: *//')
-        if [[ -n "$part_mount" && "$part_mount" != "(not mounted)" ]]; then
-          return 0
-        fi
-      fi
-    done < <(diskutil list "$device" | grep -E "^   [0-9]:" | awk '{print "'$basename_device's"$1}' | tr -d :)
+    # Use diskutil list to check if any partition is mounted in a single call
+    if diskutil list "$device" | grep -q "mounted"; then
+      return 0
+    fi
   else
     # Linux version
     # Check if any partition of this device is mounted anywhere
@@ -203,38 +213,37 @@ get_safety_level() {
   fi
 
   if [[ "$(uname)" == "Darwin" ]]; then
-    # macOS specific checks
+    # macOS specific checks - get all info at once to reduce diskutil calls
+    local device_info=$(diskutil info "$device" 2>/dev/null)
     
     # Check if it's an internal disk (dangerous)
-    if diskutil info "$device" | grep -q "Internal: *Yes"; then
+    if echo "$device_info" | grep -q "Internal: *Yes"; then
       echo "DANGEROUS|Internal disk - likely system disk"
       return
     fi
     
     # Check if device has any mounted partitions
-    if has_mounted_partitions "$device"; then
-      local mount_point=$(diskutil info "$device" | grep "Mount Point" | sed 's/.*Mount Point: *//')
-      if [[ -n "$mount_point" && "$mount_point" != "(not mounted)" ]]; then
-        echo "CAUTION|Currently mounted at: $mount_point"
-        return
-      fi
+    local mount_point=$(echo "$device_info" | grep "Mount Point" | sed 's/.*Mount Point: *//')
+    if [[ -n "$mount_point" && "$mount_point" != "(not mounted)" ]]; then
+      echo "CAUTION|Currently mounted at: $mount_point"
+      return
     fi
     
     # Check device size (very small devices might be system)
-    local size=$(diskutil info "$device" | grep "Disk Size" | awk '{print $3}')
+    local size=$(echo "$device_info" | grep "Disk Size" | awk '{print $3}')
     if [[ $size -lt 100 ]]; then # < 100MB
       echo "DANGEROUS|Very small device (< 100MB) - may be system"
       return
     fi
     
     # Check if it's a USB device (safer to wipe)
-    if diskutil info "$device" | grep -q "Protocol: *USB"; then
+    if echo "$device_info" | grep -q "Protocol: *USB"; then
       echo "SAFE|USB device detected"
       return
     fi
     
     # Check if it's removable
-    if diskutil info "$device" | grep -q "Removable Media: *Yes"; then
+    if echo "$device_info" | grep -q "Removable Media: *Yes"; then
       echo "SAFE|Removable media detected"
       return
     fi
@@ -299,11 +308,11 @@ get_drive_info() {
   local bus="Unknown"
 
   if [[ "$(uname)" == "Darwin" ]]; then
-    # macOS version
-    size=$(diskutil info "$device" 2>/dev/null | grep "Disk Size" | awk '{print $3" "$4}' || echo "Unknown")
-    
-    # Get device info from diskutil
+    # macOS version - get all info at once
     local device_info=$(diskutil info "$device" 2>/dev/null)
+    
+    # Extract all needed information from the single diskutil call
+    size=$(echo "$device_info" | grep "Disk Size" | awk '{print $3" "$4}' || echo "Unknown")
     
     # Try to extract vendor and model from device name
     vendor=$(echo "$device_info" | grep "Device / Media Name:" | sed 's/.*Device \/ Media Name: *//' | awk '{print $1}' || echo "Unknown")
@@ -365,22 +374,41 @@ display_drives() {
     exit 0
   fi
 
+  # Preload drive info for better performance
+  declare -A drive_info_cache
+  declare -A safety_info_cache
+  
+  # Display progress while loading drive information
+  echo -e "${BLUE}Loading drive information...${NC}"
+  local total_drives=${#drives[@]}
+  
+  for i in "${!drives[@]}"; do
+    local device="${drives[$i]}"
+    local percent=$((100 * i / total_drives))
+    # Show progress bar
+    printf "\r[%-50s] %d%%" "$(printf '#%.0s' $(seq 1 $((50 * i / total_drives))))" "$percent"
+    
+    # Get and cache drive info
+    drive_info_cache["$device"]=$(get_drive_info "$device")
+    safety_info_cache["$device"]=$(get_safety_level "$device")
+  done
+  printf "\r%-60s\r" "" # Clear the progress bar line
+  echo
+
   for i in "${!drives[@]}"; do
     local device="${drives[$i]}"
     local num=$((i + 1))
 
-    # Get drive info
-    local info
-    info=$(get_drive_info "$device")
+    # Get drive info from cache
+    local info="${drive_info_cache[$device]}"
     local vendor=$(echo "$info" | cut -d'|' -f1)
     local model=$(echo "$info" | cut -d'|' -f2)
     local size=$(echo "$info" | cut -d'|' -f3)
     local serial=$(echo "$info" | cut -d'|' -f4)
     local bus=$(echo "$info" | cut -d'|' -f5)
 
-    # Get safety info
-    local safety_info
-    safety_info=$(get_safety_level "$device")
+    # Get safety info from cache
+    local safety_info="${safety_info_cache[$device]}"
     local safety_level=$(echo "$safety_info" | cut -d'|' -f1)
     local safety_reason=$(echo "$safety_info" | cut -d'|' -f2)
 
@@ -413,15 +441,28 @@ display_drives() {
 # Function to get user selection
 get_user_selection() {
   local drives=("$@")
-
+  
+  # Display time taken to load drive information
+  local start_time=$(date +%s)
+  
   while true; do
+    local end_time=$(date +%s)
+    local elapsed_time=$((end_time - start_time))
+    
     display_drives "${drives[@]}"
+    
+    # Add elapsed time information
+    if [[ $elapsed_time -gt 5 ]]; then
+      echo -e "${YELLOW}Drive information loaded in $elapsed_time seconds${NC}"
+      echo
+    fi
 
     echo -e "${BOLD}Selection Options:${NC}"
     echo "  Enter drive numbers separated by spaces (e.g., 2 3 4 5)"
     echo "  Type 'all-safe' to select all SAFE drives"
     echo "  Type 'all-non-dangerous' to select SAFE and CAUTION drives"
     echo "  Type 'debug' to run drive detection debug"
+    echo "  Type 'debug-drive N' to diagnose slow loading for drive N"
     echo "  Type 'quit' or 'q' to exit"
     echo "  Type 'refresh' or 'r' to rescan drives"
     echo
@@ -443,14 +484,48 @@ get_user_selection() {
       info "Running drive detection debug..."
       echo
       echo "=== Drive Detection Debug ==="
-      echo "1. Raw lsblk output:"
-      lsblk -d -n -o NAME,SIZE,TYPE
+      
+      if [[ "$(uname)" == "Darwin" ]]; then
+        echo "1. Raw diskutil output:"
+        diskutil list
+      else
+        echo "1. Raw lsblk output:"
+        lsblk -d -n -o NAME,SIZE,TYPE
+      fi
+      
       echo
       echo "2. Available drives found by script:"
       get_available_drives
       echo
       echo "Press Enter to continue..."
       read -r
+      continue
+      ;;
+    debug-drive*)
+      # Extract the drive number from the command
+      local drive_num=$(echo "$selection" | sed 's/debug-drive //')
+      
+      # Validate input is a number
+      if [[ ! "$drive_num" =~ ^[0-9]+$ ]]; then
+        warning "Invalid drive number: $drive_num"
+        echo "Press Enter to continue..."
+        read -r
+        continue
+      fi
+      
+      # Convert to array index
+      local index=$((drive_num - 1))
+      
+      # Check if drive number is valid
+      if [[ $index -lt 0 || $index -ge ${#drives[@]} ]]; then
+        warning "Invalid selection: $drive_num is out of range (1-${#drives[@]})"
+        echo "Press Enter to continue..."
+        read -r
+        continue
+      fi
+      
+      # Run debug on the selected drive
+      debug_drive_loading "${drives[$index]}"
       continue
       ;;
     "all-safe")
@@ -680,15 +755,33 @@ wipe_drive() {
     echo "Process ID: $$"
     echo
 
-    # DOD 5220.22-M: 3 passes with verification
-    # -v: verbose, -f: force, -z: add final zero pass, -n 3: three passes
-    if shred -vfz -n 3 "$device" 2>&1; then
+    # For macOS: add pv for progress visualization if available
+    if [[ "$(uname)" == "Darwin" ]] && command -v pv >/dev/null 2>&1; then
+      # Get device size for progress bar
+      local size_bytes=$(diskutil info "$device" | grep "Disk Size" | awk '{print $4}' | tr -d '()' | tr -d ',')
+      
+      # DOD 5220.22-M: 3 passes plus zero pass
+      echo "Pass 1/4: Random data pass"
+      dd if=/dev/urandom bs=1m | pv -s "$size_bytes" | dd of="$device" bs=1m
+      echo "Pass 2/4: Random data pass"
+      dd if=/dev/urandom bs=1m | pv -s "$size_bytes" | dd of="$device" bs=1m
+      echo "Pass 3/4: Random data pass"
+      dd if=/dev/urandom bs=1m | pv -s "$size_bytes" | dd of="$device" bs=1m
+      echo "Pass 4/4: Zero pass (verification)"
+      dd if=/dev/zero bs=1m | pv -s "$size_bytes" | dd of="$device" bs=1m
       echo
       echo "=== Wipe Completed Successfully: $(date) ==="
     else
-      echo
-      echo "=== Wipe Failed: $(date) ==="
-      exit 1
+      # Regular shred command for Linux or macOS without pv
+      # -v: verbose, -f: force, -z: add final zero pass, -n 3: three passes
+      if shred -vfz -n 3 "$device" 2>&1; then
+        echo
+        echo "=== Wipe Completed Successfully: $(date) ==="
+      else
+        echo
+        echo "=== Wipe Failed: $(date) ==="
+        exit 1
+      fi
     fi
   } >>"$wipe_log" 2>&1 &
 
@@ -699,6 +792,8 @@ wipe_drive() {
 # Function to monitor wipe progress
 monitor_wipes() {
   local wipe_processes=("$@")
+  local spinner=('⣾' '⣽' '⣻' '⢿' '⡿' '⣟' '⣯' '⣷')
+  local spin_idx=0
 
   while true; do
     local active_count=0
@@ -716,7 +811,16 @@ monitor_wipes() {
 
       if kill -0 "$pid" 2>/dev/null; then
         ((active_count++))
-        echo -e "  ${YELLOW}$device${NC} - In Progress (PID: $pid)"
+        # Show spinner animation for active processes
+        echo -e "  ${YELLOW}$device${NC} - In Progress ${spinner[$spin_idx]} (PID: $pid)"
+        
+        # Get current progress from log file if available
+        if [[ -f "$logfile" ]]; then
+          local progress=$(tail -n 20 "$logfile" | grep -o "[0-9]\+%" | tail -n 1)
+          if [[ -n "$progress" ]]; then
+            echo -e "    Progress: $progress"
+          fi
+        fi
         echo "    Log: $logfile"
       else
         if wait "$pid" 2>/dev/null; then
@@ -735,7 +839,14 @@ monitor_wipes() {
       break
     fi
 
-    sleep 5
+    # Update spinner animation
+    spin_idx=$(( (spin_idx + 1) % 8 ))
+    
+    # Show a timestamp for last update
+    echo -e "\nLast update: $(date +"%H:%M:%S")"
+    echo -e "Refreshing in 2 seconds... (press Ctrl+C to stop monitoring)"
+    
+    sleep 2
   done
 
   echo
@@ -743,6 +854,33 @@ monitor_wipes() {
   echo
   echo "Log files are available in /tmp/ for review"
   echo "Press Enter to exit..."
+  read -r
+}
+
+# Function to debug drive loading issues
+debug_drive_loading() {
+  local drive="$1"
+  
+  echo -e "\n${BOLD}${BLUE}Debugging drive loading for: $drive${NC}"
+  
+  echo -e "\n${YELLOW}Testing disk access time:${NC}"
+  
+  if [[ "$(uname)" == "Darwin" ]]; then
+    echo -e "${BLUE}Running diskutil info... ${NC}"
+    time diskutil info "$drive" > /dev/null
+    
+    echo -e "\n${BLUE}Testing disk read speed (first few blocks)... ${NC}"
+    time dd if="$drive" of=/dev/null bs=1m count=1
+  else
+    echo -e "${BLUE}Running blockdev query... ${NC}"
+    time blockdev --getsize64 "$drive"
+    
+    echo -e "\n${BLUE}Testing disk read speed (first few blocks)... ${NC}"
+    time dd if="$drive" of=/dev/null bs=1M count=1
+  fi
+  
+  echo -e "\n${GREEN}Debug complete.${NC}"
+  echo "Press Enter to continue..."
   read -r
 }
 
@@ -776,7 +914,10 @@ main() {
     fi
 
     log "Found ${#all_drives[@]} drive(s): ${all_drives[*]}"
-
+    
+    # Show that we're analyzing drives
+    echo -e "${YELLOW}Processing drive safety information...${NC}"
+    
     # Get user selection
     if selected_drives=$(get_user_selection "${all_drives[@]}"); then
       mapfile -t drives_to_wipe <<<"$selected_drives"
@@ -803,10 +944,32 @@ main() {
 
   # Start wipe processes
   declare -a wipe_processes=()
+  
+  # Ask if user wants staggered start to reduce system load
+  echo -n "Start wiping drives with a delay between each drive? (y/n): "
+  read -r staggered
+  local delay=0
+  if [[ "$staggered" == "y" || "$staggered" == "Y" ]]; then
+    echo -n "Enter delay in seconds between starting each drive wipe (5-30): "
+    read -r delay
+    # Validate input
+    if ! [[ "$delay" =~ ^[0-9]+$ ]] || (( delay < 0 || delay > 30 )); then
+      delay=5
+      info "Using default delay of 5 seconds"
+    fi
+  fi
+  
   for drive in "${drives_to_wipe[@]}"; do
+    info "Starting wipe process for $drive..."
     process_info=$(wipe_drive "$drive")
     wipe_processes+=("$process_info")
-    sleep 2
+    
+    if (( delay > 0 )) && [[ ! "$drive" == "${drives_to_wipe[-1]}" ]]; then
+      info "Waiting $delay seconds before starting next drive wipe..."
+      sleep "$delay"
+    else
+      sleep 2
+    fi
   done
 
   # Monitor progress

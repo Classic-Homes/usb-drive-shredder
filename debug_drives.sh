@@ -198,7 +198,8 @@ fi
 echo
 
 echo "7. Drive Detection Function Test:"
-echo "   Function to get available drives:"
+echo "   Function to get available drives (please wait, scanning...):"
+echo -ne "   \033[33mProcessing...\033[0m\r"
 
 get_available_drives() {
   local drives=()
@@ -241,7 +242,9 @@ get_available_drives() {
   printf '%s\n' "${drives[@]}"
 }
 
+echo -ne "   \033[33mScanning disks...\033[0m\r"
 mapfile -t detected_drives < <(get_available_drives)
+echo -ne "                                        \r"  # Clear the processing line
 echo "   Detected drives:"
 if [[ ${#detected_drives[@]} -eq 0 ]]; then
   echo "   No drives detected by function"

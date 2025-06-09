@@ -23,6 +23,7 @@ A set of Bash scripts to securely wipe USB drives according to DoD 5220.22-M sta
 - `bash` 3.2+
 - `diskutil` (included in macOS)
 - `shred` (can be installed via Homebrew: `brew install coreutils`)
+- `pv` (optional, for better progress visualization: `brew install pv`)
 - Root access (sudo)
 
 ## Usage
