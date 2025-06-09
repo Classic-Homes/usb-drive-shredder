@@ -230,9 +230,12 @@ get_all_drives_detailed() {
   echo "DEBUG: Found ${#drives_info[@]} drives" >&2
 
   # Return the associative array as key-value pairs
+  echo "DEBUG: Outputting drive info" >&2
   for device in "${!drives_info[@]}"; do
+    echo "DEBUG: Outputting info for $device" >&2
     echo "$device:${drives_info[$device]}"
   done
+  echo "DEBUG: Finished outputting drive info" >&2
 }
 
 # Function to display drive selection menu
@@ -655,10 +658,13 @@ main() {
   log "Log file: $LOGFILE"
 
   while true; do
+    echo "DEBUG: Getting all drives" >&2
     # Get all drives
     mapfile -t drive_list < <(get_all_drives_detailed)
+    echo "DEBUG: Got ${#drive_list[@]} drives from get_all_drives_detailed" >&2
 
     if [[ ${#drive_list[@]} -eq 0 ]]; then
+      echo "DEBUG: No drives found, showing warning" >&2
       show_header
       warning "No drives found!"
       echo
@@ -667,8 +673,12 @@ main() {
       exit 0
     fi
 
+    echo "DEBUG: About to call get_user_selection" >&2
+
+    echo "DEBUG: About to call get_user_selection" >&2
     # Get user selection
     if selected_drives=$(get_user_selection "${drive_list[@]}"); then
+      echo "DEBUG: User selection completed" >&2
       mapfile -t drives_to_wipe <<<"$selected_drives"
 
       # Confirm selection
