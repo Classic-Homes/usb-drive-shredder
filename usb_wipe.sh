@@ -74,7 +74,7 @@ get_all_drives() {
   printf '%s\n' "${drives[@]}"
 }
 
-# Get drive info
+# Get drive info with timeout protection
 get_drive_info() {
   local device="$1"
   local vendor="Unknown"
@@ -82,23 +82,25 @@ get_drive_info() {
   local size="Unknown"
   local mounted=""
 
+  # Add timeout to prevent hanging
   if [[ "$(uname)" == "Darwin" ]]; then
-    local info=$(diskutil info "$device" 2>/dev/null || echo "")
-    vendor=$(echo "$info" | grep "Device / Media Name" | sed 's/.*: *//' | awk '{print $1}' || echo "Unknown")
-    model=$(echo "$info" | grep "Device Model" | sed 's/.*: *//' || echo "Unknown")
-    size=$(echo "$info" | grep "Disk Size" | sed 's/.*: *//' | awk '{print $1" "$2}' || echo "Unknown")
+    local info=$(timeout 5 diskutil info "$device" 2>/dev/null || echo "")
+    vendor=$(echo "$info" | grep "Device / Media Name" | sed 's/.*: *//' | awk '{print $1}' 2>/dev/null || echo "Unknown")
+    model=$(echo "$info" | grep "Device Model" | sed 's/.*: *//' 2>/dev/null || echo "Unknown")
+    size=$(echo "$info" | grep "Disk Size" | sed 's/.*: *//' | awk '{print $1" "$2}' 2>/dev/null || echo "Unknown")
 
     # Check if mounted
-    if echo "$info" | grep -q "Mounted.*Yes"; then
+    if echo "$info" | grep -q "Mounted.*Yes" 2>/dev/null; then
       mounted="MOUNTED"
     fi
   else
-    vendor=$(lsblk -d -no vendor "$device" 2>/dev/null | xargs || echo "Unknown")
-    model=$(lsblk -d -no model "$device" 2>/dev/null | xargs || echo "Unknown")
-    size=$(lsblk -d -no size "$device" 2>/dev/null || echo "Unknown")
+    # Use timeout for all lsblk commands
+    vendor=$(timeout 3 lsblk -d -no vendor "$device" 2>/dev/null | xargs 2>/dev/null || echo "Unknown")
+    model=$(timeout 3 lsblk -d -no model "$device" 2>/dev/null | xargs 2>/dev/null || echo "Unknown")
+    size=$(timeout 3 lsblk -d -no size "$device" 2>/dev/null || echo "Unknown")
 
-    # Check if any partition is mounted
-    if lsblk -no mountpoint "$device" 2>/dev/null | grep -q "/"; then
+    # Check if any partition is mounted (with timeout)
+    if timeout 3 lsblk -no mountpoint "$device" 2>/dev/null | grep -q "/" 2>/dev/null; then
       mounted="MOUNTED"
     fi
   fi
@@ -172,33 +174,42 @@ display_drives() {
     return 1
   fi
 
+  echo "Getting drive information..."
   for i in "${!drives[@]}"; do
     local device="${drives[$i]}"
-    local info=$(get_drive_info "$device")
-    local vendor=$(echo "$info" | cut -d'|' -f1)
-    local model=$(echo "$info" | cut -d'|' -f2)
-    local size=$(echo "$info" | cut -d'|' -f3)
-    local mounted=$(echo "$info" | cut -d'|' -f4)
-    local safety=$(get_safety_level "$device" "$info")
     local num=$((i + 1))
 
-    # Format the display line
-    local mount_indicator=""
-    if [[ "$mounted" == "MOUNTED" ]]; then
-      mount_indicator=" ${YELLOW}(MOUNTED)${NC}"
-    fi
+    echo -n "  [$num] $device - "
 
-    case "$safety" in
-    "SAFE")
-      echo -e "${GREEN}[$num]${NC} $device - $vendor $model ($size) ${GREEN}[SAFE]${NC}$mount_indicator"
-      ;;
-    "CAUTION")
-      echo -e "${YELLOW}[$num]${NC} $device - $vendor $model ($size) ${YELLOW}[CAUTION]${NC}$mount_indicator"
-      ;;
-    "SYSTEM")
-      echo -e "${RED}[$num]${NC} $device - $vendor $model ($size) ${RED}[SYSTEM - DO NOT WIPE]${NC}$mount_indicator"
-      ;;
-    esac
+    # Get info with error handling
+    local info
+    if info=$(get_drive_info "$device" 2>/dev/null); then
+      local vendor=$(echo "$info" | cut -d'|' -f1)
+      local model=$(echo "$info" | cut -d'|' -f2)
+      local size=$(echo "$info" | cut -d'|' -f3)
+      local mounted=$(echo "$info" | cut -d'|' -f4)
+      local safety=$(get_safety_level "$device" "$info")
+
+      # Format the display line
+      local mount_indicator=""
+      if [[ "$mounted" == "MOUNTED" ]]; then
+        mount_indicator=" ${YELLOW}(MOUNTED)${NC}"
+      fi
+
+      case "$safety" in
+      "SAFE")
+        echo -e "$vendor $model ($size) ${GREEN}[SAFE]${NC}$mount_indicator"
+        ;;
+      "CAUTION")
+        echo -e "$vendor $model ($size) ${YELLOW}[CAUTION]${NC}$mount_indicator"
+        ;;
+      "SYSTEM")
+        echo -e "$vendor $model ($size) ${RED}[SYSTEM - DO NOT WIPE]${NC}$mount_indicator"
+        ;;
+      esac
+    else
+      echo -e "${YELLOW}Info unavailable${NC}"
+    fi
   done
   echo
   return 0
