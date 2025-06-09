@@ -80,22 +80,33 @@ is_system_drive() {
 get_all_drives_detailed() {
   local -A drives_info
 
+  echo "DEBUG: Starting drive detection..." >&2
+
   # Get all block devices
   while IFS= read -r line; do
+    echo "DEBUG: Processing line: '$line'" >&2
     local device=$(echo "$line" | awk '{print $1}')
     local size=$(echo "$line" | awk '{print $2}')
     local type=$(echo "$line" | awk '{print $3}')
 
     # Skip if not a disk or if it's a partition
-    [[ "$type" != "disk" ]] && continue
+    if [[ "$type" != "disk" ]]; then
+      echo "DEBUG: Skipping $device (type: $type)" >&2
+      continue
+    fi
+
+    echo "DEBUG: Processing disk $device" >&2
 
     # Get detailed device information
+    echo "DEBUG: Getting device info for $device" >&2
     local vendor=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_VENDOR=" | cut -d'=' -f2 || echo "Unknown")
     local model=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_MODEL=" | cut -d'=' -f2 || echo "Unknown")
     local serial=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_SERIAL_SHORT=" | cut -d'=' -f2 || echo "Unknown")
     local bus_type=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_BUS=" | cut -d'=' -f2 || echo "Unknown")
     local device_path=$(udevadm info --query=path --name="/dev/$device" 2>/dev/null || echo "Unknown")
     local size_bytes=$(blockdev --getsize64 "/dev/$device" 2>/dev/null || echo "0")
+
+    echo "DEBUG: Got basic info for $device" >&2
 
     # If vendor/model are unknown, try alternative methods
     if [[ "$vendor" == "Unknown" ]] && [[ "$model" == "Unknown" ]]; then
@@ -204,6 +215,9 @@ get_all_drives_detailed() {
     drives_info["/dev/$device"]="$vendor|$model|$size|$serial|$bus_type|$connection_type|$warning_flags|$safety_level|$reasons_str"
 
   done < <(lsblk -d -n -o NAME,SIZE,TYPE)
+
+  echo "DEBUG: Finished processing drives" >&2
+  echo "DEBUG: Found ${#drives_info[@]} drives" >&2
 
   # Return the associative array as key-value pairs
   for device in "${!drives_info[@]}"; do
