@@ -379,20 +379,43 @@ display_drives() {
   declare -A safety_info_cache
   
   # Display progress while loading drive information
-  echo -e "${BLUE}Loading drive information...${NC}"
+  echo -e "${BLUE}Loading drive information (this may take a moment)...${NC}"
   local total_drives=${#drives[@]}
+  local timeout_seconds=15
   
   for i in "${!drives[@]}"; do
     local device="${drives[$i]}"
     local percent=$((100 * i / total_drives))
-    # Show progress bar
-    printf "\r[%-50s] %d%%" "$(printf '#%.0s' $(seq 1 $((50 * i / total_drives))))" "$percent"
+    local drive_number=$((i + 1))
     
-    # Get and cache drive info
-    drive_info_cache["$device"]=$(get_drive_info "$device")
-    safety_info_cache["$device"]=$(get_safety_level "$device")
+    # Show progress bar with drive info
+    printf "\r[%-50s] %d%% (Drive %d/%d: %s)" "$(printf '#%.0s' $(seq 1 $((50 * i / total_drives))))" "$percent" "$drive_number" "$total_drives" "$(basename "$device")"
+    
+    # Get and cache drive info with timeout
+    if [[ "$(uname)" == "Darwin" ]]; then
+      # Use the run_with_timeout function for macOS
+      drive_info_cache["$device"]=$(run_with_timeout $timeout_seconds get_drive_info "$device")
+      if [[ "${drive_info_cache[$device]}" == "TIMEOUT" ]]; then
+        drive_info_cache["$device"]="Unknown|Unknown|Unknown|Unknown|Unknown"
+        echo -e "\n${YELLOW}Warning: Timeout while getting info for $device${NC}"
+      fi
+      
+      safety_info_cache["$device"]=$(run_with_timeout $timeout_seconds get_safety_level "$device")
+      if [[ "${safety_info_cache[$device]}" == "TIMEOUT" ]]; then
+        safety_info_cache["$device"]="CAUTION|Device access timed out"
+        echo -e "\n${YELLOW}Warning: Timeout while checking safety for $device${NC}"
+      fi
+    else
+      # For Linux, use the standard approach
+      drive_info_cache["$device"]=$(get_drive_info "$device")
+      safety_info_cache["$device"]=$(get_safety_level "$device")
+    fi
+    
+    # Provide visual feedback for each drive processed
+    echo -ne "\r\033[K" # Clear current line
   done
-  printf "\r%-60s\r" "" # Clear the progress bar line
+  
+  echo -e "\r\033[K${GREEN}Drive information loaded successfully.${NC}"
   echo
 
   for i in "${!drives[@]}"; do
@@ -624,6 +647,10 @@ confirm_selection() {
   local drives=("$@")
   local has_dangerous=false
   local has_caution=false
+  
+  # Initialize caches if not already done
+  declare -A confirm_drive_cache
+  declare -A confirm_safety_cache
 
   show_header
   echo -e "${BOLD}${RED}FINAL CONFIRMATION${NC}"
@@ -631,15 +658,35 @@ confirm_selection() {
   echo -e "${RED}You have selected the following drives for DOD 5220.22-M wiping:${NC}"
   echo
 
+  # First gather all drive info with timeout protection
+  echo -e "${BLUE}Gathering final drive information...${NC}"
+  
   for drive in "${drives[@]}"; do
-    local info
-    info=$(get_drive_info "$drive")
+    if [[ "$(uname)" == "Darwin" ]]; then
+      confirm_drive_cache["$drive"]=$(run_with_timeout 10 get_drive_info "$drive")
+      if [[ "${confirm_drive_cache[$drive]}" == "TIMEOUT" ]]; then
+        confirm_drive_cache["$drive"]="Unknown|Unknown|Unknown|Unknown|Unknown"
+      fi
+      
+      confirm_safety_cache["$drive"]=$(run_with_timeout 10 get_safety_level "$drive")
+      if [[ "${confirm_safety_cache[$drive]}" == "TIMEOUT" ]]; then
+        confirm_safety_cache["$drive"]="CAUTION|Device access timed out"
+      fi
+    else
+      confirm_drive_cache["$drive"]=$(get_drive_info "$drive")
+      confirm_safety_cache["$drive"]=$(get_safety_level "$drive")
+    fi
+    echo -n "."
+  done
+  echo -e "\n"
+  
+  for drive in "${drives[@]}"; do
+    local info="${confirm_drive_cache[$drive]}"
     local vendor=$(echo "$info" | cut -d'|' -f1)
     local model=$(echo "$info" | cut -d'|' -f2)
     local size=$(echo "$info" | cut -d'|' -f3)
 
-    local safety_info
-    safety_info=$(get_safety_level "$drive")
+    local safety_info="${confirm_safety_cache[$drive]}"
     local safety_level=$(echo "$safety_info" | cut -d'|' -f1)
     local safety_reason=$(echo "$safety_info" | cut -d'|' -f2)
 
@@ -884,6 +931,39 @@ debug_drive_loading() {
   read -r
 }
 
+# Function to run a command with timeout
+run_with_timeout() {
+  local timeout=$1
+  local command=$2
+  local args=${@:3}
+  
+  # Create a temp file for the result
+  local tmpfile=$(mktemp)
+  
+  # Run the command in background
+  (eval "$command $args" > "$tmpfile" 2>/dev/null) &
+  local pid=$!
+  
+  # Wait for command to complete or timeout
+  local count=0
+  while kill -0 $pid 2>/dev/null && [ $count -lt $timeout ]; do
+    sleep 1
+    ((count++))
+  done
+  
+  # If still running after timeout, kill it
+  if kill -0 $pid 2>/dev/null; then
+    kill -TERM $pid 2>/dev/null || kill -KILL $pid 2>/dev/null
+    echo "TIMEOUT" > "$tmpfile"
+  fi
+  
+  # Get the result
+  local result=$(cat "$tmpfile")
+  rm -f "$tmpfile"
+  
+  echo "$result"
+}
+
 # Main function
 main() {
   log "=== Drive DOD 5220.22-M Wipe Script Started ==="
@@ -914,9 +994,6 @@ main() {
     fi
 
     log "Found ${#all_drives[@]} drive(s): ${all_drives[*]}"
-    
-    # Show that we're analyzing drives
-    echo -e "${YELLOW}Processing drive safety information...${NC}"
     
     # Get user selection
     if selected_drives=$(get_user_selection "${all_drives[@]}"); then
