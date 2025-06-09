@@ -48,50 +48,29 @@ check_requirements() {
   fi
 }
 
-# Get list of drives (removable first, then manual mode)
+# Get list of all disk drives
 get_drives() {
-  local drives=()
-  local mode="$1" # "auto" or "manual"
-
   if [[ "$(uname)" == "Darwin" ]]; then
-    # macOS: Find external/USB drives
+    # macOS: Find all disk drives
     local device_list
     if device_list=$(diskutil list 2>/dev/null | grep -E "^/dev/disk[0-9]+" | awk '{print $1}'); then
       echo "$device_list" | while read -r device; do
-        if [[ -n "$device" && "$device" =~ /dev/disk[0-9]+$ ]]; then
-          if [[ -r "$device" ]]; then
-            if [[ "$mode" == "manual" ]]; then
-              echo "$device"
-            else
-              local info
-              if info=$(timeout 5 diskutil info "$device" 2>/dev/null); then
-                if echo "$info" | grep -E "(Removable Media: +Yes|Protocol: +USB)" >/dev/null; then
-                  echo "$device"
-                fi
-              fi
-            fi
-          fi
+        if [[ -n "$device" && "$device" =~ /dev/disk[0-9]+$ && -r "$device" ]]; then
+          echo "$device"
         fi
       done
     fi
   else
-    # Linux: Find drives
+    # Linux: Find all disk drives
     local lsblk_output
-    if lsblk_output=$(lsblk -d -n -o NAME,MAJ:MIN,RM,SIZE,RO,TYPE 2>/dev/null); then
+    if lsblk_output=$(lsblk -d -n -o NAME,TYPE 2>/dev/null); then
       echo "$lsblk_output" | while read -r line; do
         if [[ -n "$line" ]]; then
           local name=$(echo "$line" | awk '{print $1}')
-          local removable=$(echo "$line" | awk '{print $3}')
-          local type=$(echo "$line" | awk '{print $6}')
+          local type=$(echo "$line" | awk '{print $2}')
 
           if [[ "$type" == "disk" ]]; then
-            if [[ "$mode" == "manual" ]]; then
-              # Manual mode: show all disk drives
-              echo "/dev/$name"
-            elif [[ "$removable" == "1" ]]; then
-              # Auto mode: only removable drives
-              echo "/dev/$name"
-            fi
+            echo "/dev/$name"
           fi
         fi
       done
