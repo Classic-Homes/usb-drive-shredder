@@ -316,8 +316,16 @@ get_user_selection() {
   local drives=("$@")
   local selected_drives=()
 
+  echo "DEBUG: get_user_selection called with ${#drives[@]} drives" >&2
+  for i in "${!drives[@]}"; do
+    echo "DEBUG: Drive $i: '${drives[$i]}'" >&2
+  done
+
   while true; do
+    echo "DEBUG: About to call display_drive_menu" >&2
+    echo "DEBUG: About to call display_drive_menu" >&2
     display_drive_menu "${drives[@]}"
+    echo "DEBUG: display_drive_menu completed" >&2
 
     echo -e "${BOLD}Selection Options:${NC}"
     echo "  Enter drive numbers separated by spaces (e.g., 1 3 5)"
@@ -660,8 +668,17 @@ main() {
   while true; do
     echo "DEBUG: Getting all drives" >&2
     # Get all drives
-    mapfile -t drive_list < <(get_all_drives_detailed)
-    echo "DEBUG: Got ${#drive_list[@]} drives from get_all_drives_detailed" >&2
+    mapfile -t drive_list_raw < <(get_all_drives_detailed)
+
+    # Filter out empty entries
+    drive_list=()
+    for entry in "${drive_list_raw[@]}"; do
+      if [[ -n "$entry" && "$entry" =~ ^/dev/ ]]; then
+        drive_list+=("$entry")
+      fi
+    done
+
+    echo "DEBUG: Got ${#drive_list_raw[@]} raw entries, ${#drive_list[@]} valid drives" >&2
 
     if [[ ${#drive_list[@]} -eq 0 ]]; then
       echo "DEBUG: No drives found, showing warning" >&2
