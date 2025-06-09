@@ -76,6 +76,53 @@ is_system_drive() {
   return 1 # Not system drive
 }
 
+# Function to check if a device is USB-connected (with fallback methods)
+is_usb_device() {
+  local device="$1"
+  local device_name=$(basename "$device")
+
+  # Method 1: Check udev properties for USB bus
+  if udevadm info --query=property --name="$device" 2>/dev/null | grep -q "ID_BUS=usb"; then
+    return 0
+  fi
+
+  # Method 2: Check for USB in device path
+  local device_path=$(udevadm info --query=path --name="$device" 2>/dev/null)
+  if [[ "$device_path" =~ usb ]]; then
+    return 0
+  fi
+
+  # Method 3: Check if device vendor/model contains USB indicators
+  local vendor=$(udevadm info --query=property --name="$device" 2>/dev/null | grep "ID_VENDOR=" | cut -d'=' -f2 || echo "")
+  local model=$(udevadm info --query=property --name="$device" 2>/dev/null | grep "ID_MODEL=" | cut -d'=' -f2 || echo "")
+  if [[ "$vendor" =~ [Uu][Ss][Bb] ]] || [[ "$model" =~ [Uu][Ss][Bb] ]]; then
+    return 0
+  fi
+
+  # Method 4: For Proxmox passthrough, check if device is not sda (usually the system drive)
+  # and appears to be a removable/external device
+  if [[ "$device_name" != "sda" ]]; then
+    # Check if device is removable
+    local removable=$(cat "/sys/block/$device_name/removable" 2>/dev/null || echo "0")
+    if [[ "$removable" == "1" ]]; then
+      return 0
+    fi
+
+    # In Proxmox passthrough scenarios, USB drives might appear as regular SCSI devices
+    # Check if this is likely a non-system drive
+    local rotational=$(cat "/sys/block/$device_name/queue/rotational" 2>/dev/null || echo "1")
+    local size_bytes=$(blockdev --getsize64 "$device" 2>/dev/null || echo "0")
+
+    # If it's not the first drive (sda) and has characteristics of external storage
+    # we'll consider it potentially USB (user can still exclude via safety checks)
+    if [[ $size_bytes -gt 1073741824 ]]; then # Larger than 1GB
+      return 0
+    fi
+  fi
+
+  return 1 # Not detected as USB
+}
+
 # Function to get USB drives with detailed info
 get_usb_drives_detailed() {
   local -A drives_info
@@ -89,13 +136,20 @@ get_usb_drives_detailed() {
     # Skip if not a disk or if it's a partition
     [[ "$type" != "disk" ]] && continue
 
-    # Check if device is USB connected
-    if udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep -q "ID_BUS=usb"; then
+    # Check if device is USB connected (with multiple detection methods)
+    if is_usb_device "/dev/$device"; then
       # Get detailed device information
       local vendor=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_VENDOR=" | cut -d'=' -f2 || echo "Unknown")
       local model=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_MODEL=" | cut -d'=' -f2 || echo "Unknown")
       local serial=$(udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep "ID_SERIAL_SHORT=" | cut -d'=' -f2 || echo "Unknown")
       local size_bytes=$(blockdev --getsize64 "/dev/$device" 2>/dev/null || echo "0")
+
+      # If vendor/model are unknown, try alternative methods
+      if [[ "$vendor" == "Unknown" ]] && [[ "$model" == "Unknown" ]]; then
+        # Try to get info from /sys
+        vendor=$(cat "/sys/block/$device/device/vendor" 2>/dev/null | tr -d ' ' || echo "Unknown")
+        model=$(cat "/sys/block/$device/device/model" 2>/dev/null | tr -d ' ' || echo "Unknown")
+      fi
 
       # Safety checks
       local warning_flags=""
@@ -151,6 +205,15 @@ get_usb_drives_detailed() {
       if udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep -E "(LVM|MD_|RAID)"; then
         warning_flags+="[LVM-RAID] "
         is_safe=false
+      fi
+
+      # Additional safety for sda - always mark as unsafe unless explicitly USB
+      if [[ "$device" == "sda" ]]; then
+        # Double-check if this is really USB and not the system drive
+        if ! udevadm info --query=property --name="/dev/$device" 2>/dev/null | grep -q "ID_BUS=usb"; then
+          warning_flags+="[LIKELY-SYSTEM] "
+          is_safe=false
+        fi
       fi
 
       # Store drive information
