@@ -207,9 +207,13 @@ get_selection() {
   while true; do
     display_drives "${drives[@]}"
 
-    echo "Enter drive numbers (space-separated) or 'q' to quit:"
-    echo "Example: 1 3 4"
-    echo -n "Selection: "
+    echo -e "${BOLD}Selection Instructions:${NC}"
+    echo "• Enter drive numbers separated by spaces (example: 2 3 4 5)"
+    echo "• Type 'q' to quit"
+    echo "• Avoid DANGEROUS drives (likely system drives)"
+    echo "• CAUTION drives need careful verification"
+    echo
+    echo -n "Your selection: "
     read -r selection
 
     if [[ "$selection" == "q" ]]; then
@@ -221,21 +225,32 @@ get_selection() {
 
     for num in $selection; do
       if [[ ! "$num" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Invalid input: '$num'${NC}"
+        echo -e "${RED}Invalid input: '$num' is not a number${NC}"
         valid=false
         break
       fi
 
       local index=$((num - 1))
       if [[ $index -lt 0 || $index -ge ${#drives[@]} ]]; then
-        echo -e "${RED}Invalid number: $num${NC}"
+        echo -e "${RED}Invalid number: $num (valid range: 1-${#drives[@]})${NC}"
         valid=false
         break
       fi
 
       local device="${drives[$index]}"
       if ! is_safe_drive "$device"; then
-        echo -e "${RED}Skipping unsafe drive: $device${NC}"
+        echo -e "${RED}WARNING: $device appears to be a system drive!${NC}"
+        echo -n "Are you sure you want to include this DANGEROUS drive? (type 'YES' to confirm): "
+        read -r confirm
+        if [[ "$confirm" != "YES" ]]; then
+          echo "Skipping $device"
+          continue
+        fi
+      fi
+
+      # Check for duplicates
+      if [[ " ${selected[*]} " =~ " $device " ]]; then
+        echo -e "${YELLOW}Drive $device already selected${NC}"
         continue
       fi
 
@@ -249,14 +264,25 @@ get_selection() {
     fi
 
     if [[ ${#selected[@]} -eq 0 ]]; then
-      echo -e "${YELLOW}No valid drives selected.${NC}"
+      echo -e "${YELLOW}No drives selected.${NC}"
       echo "Press Enter to try again..."
       read -r
       continue
     fi
 
-    printf '%s\n' "${selected[@]}"
-    return 0
+    echo
+    echo -e "${GREEN}Selected ${#selected[@]} drive(s):${NC}"
+    for drive in "${selected[@]}"; do
+      echo "  $drive"
+    done
+    echo
+    echo -n "Proceed with these drives? (y/N): "
+    read -r confirm
+
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+      printf '%s\n' "${selected[@]}"
+      return 0
+    fi
   done
 }
 
@@ -428,12 +454,7 @@ main() {
     fi
   fi
 
-  # Get user selection
-  if ! display_drives "${drives[@]}"; then
-    echo "No drives available for selection."
-    exit 1
-  fi
-
+  # Display drives and get user selection
   mapfile -t selected < <(get_selection "${drives[@]}")
 
   # Confirm
