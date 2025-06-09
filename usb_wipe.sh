@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Simple USB Drive Wiper - DoD 5220.22-M Standard
-# Simplified version focusing on core functionality
+# Simplified USB Drive Wiper - DoD 5220.22-M Standard
+# Shows all drives immediately for VM environments
 
 set -euo pipefail
 
@@ -29,7 +29,6 @@ check_requirements() {
         missing+=("$cmd")
       fi
     done
-    # Check for shred (from coreutils)
     if ! command -v shred >/dev/null 2>&1; then
       echo -e "${YELLOW}Warning: 'shred' not found. Install with: brew install coreutils${NC}"
       echo "Will use dd for wiping instead"
@@ -48,104 +47,124 @@ check_requirements() {
   fi
 }
 
-# Get list of all disk drives
-get_drives() {
-  if [[ "$(uname)" == "Darwin" ]]; then
-    # macOS: Find all disk drives
-    local device_list
-    if device_list=$(diskutil list 2>/dev/null | grep -E "^/dev/disk[0-9]+" | awk '{print $1}'); then
-      echo "$device_list" | while read -r device; do
-        if [[ -n "$device" && "$device" =~ /dev/disk[0-9]+$ && -r "$device" ]]; then
-          echo "$device"
-        fi
-      done
-    fi
-  else
-    # Linux: Find all disk drives
-    local lsblk_output
-    if lsblk_output=$(lsblk -d -n -o NAME,TYPE 2>/dev/null); then
-      echo "$lsblk_output" | while read -r line; do
-        if [[ -n "$line" ]]; then
-          local name=$(echo "$line" | awk '{print $1}')
-          local type=$(echo "$line" | awk '{print $2}')
+# Get all disk drives (simplified - no filtering)
+get_all_drives() {
+  local drives=()
 
-          if [[ "$type" == "disk" ]]; then
-            echo "/dev/$name"
-          fi
+  if [[ "$(uname)" == "Darwin" ]]; then
+    # macOS: Get all disk drives
+    while read -r device; do
+      if [[ -n "$device" && "$device" =~ /dev/disk[0-9]+$ && -r "$device" ]]; then
+        drives+=("$device")
+      fi
+    done < <(diskutil list 2>/dev/null | grep -E "^/dev/disk[0-9]+" | awk '{print $1}')
+  else
+    # Linux: Get all disk drives
+    while read -r line; do
+      if [[ -n "$line" ]]; then
+        local name=$(echo "$line" | awk '{print $1}')
+        local type=$(echo "$line" | awk '{print $2}')
+        if [[ "$type" == "disk" ]]; then
+          drives+=("/dev/$name")
         fi
-      done
-    fi
+      fi
+    done < <(lsblk -d -n -o NAME,TYPE 2>/dev/null)
   fi
+
+  printf '%s\n' "${drives[@]}"
 }
 
-# Get drive info with better USB detection
+# Get drive info
 get_drive_info() {
   local device="$1"
   local vendor="Unknown"
   local model="Unknown"
   local size="Unknown"
-  local connection="Unknown"
+  local mounted=""
 
   if [[ "$(uname)" == "Darwin" ]]; then
     local info=$(diskutil info "$device" 2>/dev/null || echo "")
     vendor=$(echo "$info" | grep "Device / Media Name" | sed 's/.*: *//' | awk '{print $1}' || echo "Unknown")
     model=$(echo "$info" | grep "Device Model" | sed 's/.*: *//' || echo "Unknown")
     size=$(echo "$info" | grep "Disk Size" | sed 's/.*: *//' | awk '{print $1" "$2}' || echo "Unknown")
-    connection=$(echo "$info" | grep "Protocol" | sed 's/.*: *//' || echo "Unknown")
+
+    # Check if mounted
+    if echo "$info" | grep -q "Mounted.*Yes"; then
+      mounted="MOUNTED"
+    fi
   else
     vendor=$(lsblk -d -no vendor "$device" 2>/dev/null | xargs || echo "Unknown")
     model=$(lsblk -d -no model "$device" 2>/dev/null | xargs || echo "Unknown")
     size=$(lsblk -d -no size "$device" 2>/dev/null || echo "Unknown")
 
-    # Check if it's USB connected
-    local device_name=$(basename "$device")
-    if udevadm info --query=property --name="$device" 2>/dev/null | grep -q "ID_BUS=usb"; then
-      connection="USB"
-    elif [[ -e "/sys/block/$device_name/removable" ]] && [[ "$(cat /sys/block/$device_name/removable 2>/dev/null)" == "1" ]]; then
-      connection="Removable"
-    else
-      connection="Internal"
+    # Check if any partition is mounted
+    if lsblk -no mountpoint "$device" 2>/dev/null | grep -q "/"; then
+      mounted="MOUNTED"
     fi
   fi
 
-  echo "$vendor|$model|$size|$connection"
+  echo "$vendor|$model|$size|$mounted"
 }
 
-# Check if drive is safe to wipe
-is_safe_drive() {
+# Determine safety level based on common patterns
+get_safety_level() {
   local device="$1"
+  local info="$2"
+  local size=$(echo "$info" | cut -d'|' -f3)
+  local mounted=$(echo "$info" | cut -d'|' -f4)
 
+  # Check for obvious system drive patterns
   if [[ "$(uname)" == "Darwin" ]]; then
-    # Check if it's an internal drive
-    if diskutil info "$device" 2>/dev/null | grep -q "Internal: *Yes"; then
-      return 1
+    # macOS: disk0 is usually the system drive
+    if [[ "$device" == "/dev/disk0" ]]; then
+      echo "SYSTEM"
+      return
     fi
-    # Check if mounted to system paths
-    local mount_point=$(diskutil info "$device" | grep "Mount Point" | sed 's/.*: *//')
-    if [[ "$mount_point" == "/" || "$mount_point" == "/System" ]]; then
-      return 1
+    # Check if it's the boot drive
+    if diskutil info "$device" 2>/dev/null | grep -q "Boot Drive.*Yes"; then
+      echo "SYSTEM"
+      return
     fi
   else
-    # Check if it's sda (usually system drive)
+    # Linux: sda is usually the system drive
     if [[ "$device" == "/dev/sda" ]]; then
-      return 1
+      echo "SYSTEM"
+      return
     fi
-    # Check if mounted to system paths
-    if mount | grep "^$device" | grep -E "( /| /boot| /home)" >/dev/null; then
-      return 1
+    # Check if mounted to system locations
+    if mount | grep "^$device" | grep -E "( /| /boot| /home)" >/dev/null 2>&1; then
+      echo "SYSTEM"
+      return
     fi
   fi
 
-  return 0
+  # Check if mounted (could be important)
+  if [[ "$mounted" == "MOUNTED" ]]; then
+    echo "CAUTION"
+    return
+  fi
+
+  # Large drives might be important
+  if [[ "$size" =~ ([0-9]+).*TB ]] && [[ ${BASH_REMATCH[1]} -gt 1 ]]; then
+    echo "CAUTION"
+    return
+  fi
+
+  echo "SAFE"
 }
 
-# Display drives with connection info
+# Display all drives with safety indicators
 display_drives() {
   local drives=("$@")
 
   clear
-  echo -e "${BOLD}${BLUE}USB Drive Wiper - Available Drives${NC}"
+  echo -e "${BOLD}${BLUE}USB Drive Wiper - All Available Drives${NC}"
   echo "========================================"
+  echo
+  echo -e "${BOLD}Legend:${NC}"
+  echo -e "  ${GREEN}SAFE${NC}     - Likely removable/external drive"
+  echo -e "  ${YELLOW}CAUTION${NC}  - Mounted or large drive - verify carefully"
+  echo -e "  ${RED}SYSTEM${NC}   - Likely system drive - DO NOT WIPE"
   echo
 
   if [[ ${#drives[@]} -eq 0 ]]; then
@@ -159,27 +178,33 @@ display_drives() {
     local vendor=$(echo "$info" | cut -d'|' -f1)
     local model=$(echo "$info" | cut -d'|' -f2)
     local size=$(echo "$info" | cut -d'|' -f3)
-    local connection=$(echo "$info" | cut -d'|' -f4)
+    local mounted=$(echo "$info" | cut -d'|' -f4)
+    local safety=$(get_safety_level "$device" "$info")
     local num=$((i + 1))
 
-    # Color code based on safety and connection type
-    if is_safe_drive "$device"; then
-      if [[ "$connection" == "USB" ]]; then
-        echo -e "${GREEN}[$num]${NC} $device - $vendor $model ($size) ${GREEN}[USB - SAFE]${NC}"
-      elif [[ "$connection" == "Removable" ]]; then
-        echo -e "${GREEN}[$num]${NC} $device - $vendor $model ($size) ${GREEN}[REMOVABLE - SAFE]${NC}"
-      else
-        echo -e "${YELLOW}[$num]${NC} $device - $vendor $model ($size) ${YELLOW}[INTERNAL - CAUTION]${NC}"
-      fi
-    else
-      echo -e "${RED}[$num]${NC} $device - $vendor $model ($size) ${RED}[SYSTEM - DANGEROUS]${NC}"
+    # Format the display line
+    local mount_indicator=""
+    if [[ "$mounted" == "MOUNTED" ]]; then
+      mount_indicator=" ${YELLOW}(MOUNTED)${NC}"
     fi
+
+    case "$safety" in
+    "SAFE")
+      echo -e "${GREEN}[$num]${NC} $device - $vendor $model ($size) ${GREEN}[SAFE]${NC}$mount_indicator"
+      ;;
+    "CAUTION")
+      echo -e "${YELLOW}[$num]${NC} $device - $vendor $model ($size) ${YELLOW}[CAUTION]${NC}$mount_indicator"
+      ;;
+    "SYSTEM")
+      echo -e "${RED}[$num]${NC} $device - $vendor $model ($size) ${RED}[SYSTEM - DO NOT WIPE]${NC}$mount_indicator"
+      ;;
+    esac
   done
   echo
   return 0
 }
 
-# Get user selection
+# Get user selection with safety checks
 get_selection() {
   local drives=("$@")
 
@@ -187,10 +212,10 @@ get_selection() {
     display_drives "${drives[@]}"
 
     echo -e "${BOLD}Selection Instructions:${NC}"
-    echo "• Enter drive numbers separated by spaces (example: 2 3 4 5)"
+    echo "• Enter drive numbers separated by spaces (example: 2 3 4)"
     echo "• Type 'q' to quit"
-    echo "• Avoid DANGEROUS drives (likely system drives)"
-    echo "• CAUTION drives need careful verification"
+    echo "• ${RED}AVOID drives marked as SYSTEM${NC}"
+    echo "• ${YELLOW}Double-check CAUTION drives${NC}"
     echo
     echo -n "Your selection: "
     read -r selection
@@ -201,6 +226,7 @@ get_selection() {
 
     local selected=()
     local valid=true
+    local has_system=false
 
     for num in $selection; do
       if [[ ! "$num" =~ ^[0-9]+$ ]]; then
@@ -217,9 +243,22 @@ get_selection() {
       fi
 
       local device="${drives[$index]}"
-      if ! is_safe_drive "$device"; then
-        echo -e "${RED}WARNING: $device appears to be a system drive!${NC}"
-        echo -n "Are you sure you want to include this DANGEROUS drive? (type 'YES' to confirm): "
+      local info=$(get_drive_info "$device")
+      local safety=$(get_safety_level "$device" "$info")
+
+      # Check safety level
+      if [[ "$safety" == "SYSTEM" ]]; then
+        echo -e "${RED}ERROR: $device is marked as SYSTEM drive - refusing to select${NC}"
+        has_system=true
+        valid=false
+        continue
+      fi
+
+      if [[ "$safety" == "CAUTION" ]]; then
+        echo -e "${YELLOW}WARNING: $device is marked as CAUTION${NC}"
+        echo -e "  Device: $device"
+        echo -e "  Info: $(echo "$info" | tr '|' ' - ')"
+        echo -n "Are you sure? Type 'YES' to confirm: "
         read -r confirm
         if [[ "$confirm" != "YES" ]]; then
           echo "Skipping $device"
@@ -237,6 +276,9 @@ get_selection() {
     done
 
     if [[ "$valid" == "false" ]]; then
+      if [[ "$has_system" == "true" ]]; then
+        echo -e "${RED}Please remove SYSTEM drives from your selection.${NC}"
+      fi
       echo "Press Enter to try again..."
       read -r
       continue
@@ -252,7 +294,8 @@ get_selection() {
     echo
     echo -e "${GREEN}Selected ${#selected[@]} drive(s):${NC}"
     for drive in "${selected[@]}"; do
-      echo "  $drive"
+      local info=$(get_drive_info "$drive")
+      echo "  $drive - $(echo "$info" | tr '|' ' - ')"
     done
     echo
     echo -n "Proceed with these drives? (y/N): "
@@ -265,7 +308,7 @@ get_selection() {
   done
 }
 
-# Confirm selection
+# Final confirmation
 confirm_wipe() {
   local drives=("$@")
 
@@ -273,23 +316,19 @@ confirm_wipe() {
   echo -e "${BOLD}${RED}FINAL CONFIRMATION${NC}"
   echo "=================="
   echo
-  echo -e "${RED}The following drives will be PERMANENTLY WIPED:${NC}"
+  echo -e "${RED}The following drives will be PERMANENTLY WIPED using DoD 5220.22-M standard:${NC}"
   echo
 
   for drive in "${drives[@]}"; do
     local info=$(get_drive_info "$drive")
-    local vendor=$(echo "$info" | cut -d'|' -f1)
-    local model=$(echo "$info" | cut -d'|' -f2)
-    local size=$(echo "$info" | cut -d'|' -f3)
-    local connection=$(echo "$info" | cut -d'|' -f4)
-    echo -e "  ${YELLOW}$drive${NC} - $vendor $model ($size) [$connection]"
+    echo -e "  ${YELLOW}$drive${NC} - $(echo "$info" | tr '|' ' - ')"
   done
 
   echo
-  echo -e "${RED}${BOLD}This will permanently destroy all data!${NC}"
-  echo -e "${RED}${BOLD}This cannot be undone!${NC}"
+  echo -e "${RED}${BOLD}THIS WILL PERMANENTLY DESTROY ALL DATA!${NC}"
+  echo -e "${RED}${BOLD}THIS CANNOT BE UNDONE!${NC}"
   echo
-  echo "Type 'WIPE' to confirm:"
+  echo "Type 'WIPE' exactly to confirm:"
   read -r confirmation
 
   [[ "$confirmation" == "WIPE" ]]
@@ -299,16 +338,16 @@ confirm_wipe() {
 unmount_drive() {
   local device="$1"
 
+  echo "    Unmounting $device..."
   if [[ "$(uname)" == "Darwin" ]]; then
     diskutil unmountDisk force "$device" 2>/dev/null || true
   else
     # Unmount all partitions
-    for part in $(lsblk -ln -o NAME "$device" | tail -n +2); do
+    for part in $(lsblk -ln -o NAME "$device" 2>/dev/null | tail -n +2); do
       umount "/dev/$part" 2>/dev/null || true
     done
     umount "$device" 2>/dev/null || true
   fi
-
   sleep 1
 }
 
@@ -317,55 +356,52 @@ wipe_drive() {
   local device="$1"
   local report_file="/tmp/wipe_report_$(basename "$device")_$(date +%Y%m%d_%H%M%S).txt"
 
-  # Create report header
-  cat >"$report_file" <<EOF
-===================================
-Drive Wipe Report
-===================================
-Date: $(date)
-Device: $device
-Standard: DoD 5220.22-M (3 passes + zero)
-Status: IN PROGRESS
-
-Drive Information:
-$(get_drive_info "$device" | tr '|' '\n' | nl -w2 -s': ')
-
-Wipe Process:
-EOF
-
   echo -e "${BLUE}Wiping $device...${NC}"
 
-  # Unmount first
-  echo "  Unmounting..." | tee -a "$report_file"
+  # Create report
+  {
+    echo "====================================="
+    echo "Drive Wipe Report"
+    echo "====================================="
+    echo "Date: $(date)"
+    echo "Device: $device"
+    echo "Standard: DoD 5220.22-M (3 passes + zero)"
+    echo
+    echo "Drive Information:"
+    get_drive_info "$device" | tr '|' '\n' | nl -w2 -s': '
+    echo
+    echo "Wipe Process:"
+  } >"$report_file"
+
+  # Unmount
   unmount_drive "$device"
 
   local start_time=$(date +%s)
+  local status="SUCCESS"
 
   if command -v shred >/dev/null 2>&1; then
-    echo "  Using shred (DoD 5220.22-M: 3 passes + zero)..." | tee -a "$report_file"
-    if shred -vfz -n 3 "$device" >>"$report_file" 2>&1; then
-      local status="SUCCESS"
-    else
-      local status="FAILED"
+    echo "    Using shred (DoD 5220.22-M: 3 passes + zero)..."
+    echo "$(date): Starting shred operation" >>"$report_file"
+    if ! shred -vfz -n 3 "$device" >>"$report_file" 2>&1; then
+      status="FAILED"
     fi
   else
-    # Fallback to dd (mainly for macOS without shred)
-    echo "  Using dd (3 random passes + zero)..." | tee -a "$report_file"
-    local size_bytes=$(diskutil info "$device" | grep "Disk Size" | awk '{print $4}' | tr -d '(),')
+    echo "    Using dd (3 random passes + zero)..."
+    echo "$(date): Starting dd operation (fallback)" >>"$report_file"
 
     for pass in 1 2 3; do
-      echo "    Pass $pass/4: Random data" | tee -a "$report_file"
-      if ! dd if=/dev/urandom of="$device" bs=1m 2>>"$report_file"; then
+      echo "      Pass $pass/4: Random data"
+      echo "$(date): Pass $pass - random data" >>"$report_file"
+      if ! dd if=/dev/urandom of="$device" bs=1M 2>>"$report_file"; then
         status="FAILED"
         break
       fi
     done
 
     if [[ "$status" != "FAILED" ]]; then
-      echo "    Pass 4/4: Zero fill" | tee -a "$report_file"
-      if dd if=/dev/zero of="$device" bs=1m 2>>"$report_file"; then
-        status="SUCCESS"
-      else
+      echo "      Pass 4/4: Zero fill"
+      echo "$(date): Pass 4 - zero fill" >>"$report_file"
+      if ! dd if=/dev/zero of="$device" bs=1M 2>>"$report_file"; then
         status="FAILED"
       fi
     fi
@@ -375,68 +411,46 @@ EOF
   local duration=$((end_time - start_time))
 
   # Update report
-  cat >>"$report_file" <<EOF
-
-Wipe Completed: $(date)
-Duration: ${duration} seconds
-Final Status: $status
-EOF
+  {
+    echo
+    echo "Wipe Completed: $(date)"
+    echo "Duration: ${duration} seconds"
+    echo "Final Status: $status"
+  } >>"$report_file"
 
   if [[ "$status" == "SUCCESS" ]]; then
-    echo -e "  ${GREEN}✓ Completed successfully${NC}"
+    echo -e "    ${GREEN}✓ Completed successfully${NC}"
   else
-    echo -e "  ${RED}✗ Failed${NC}"
+    echo -e "    ${RED}✗ Failed${NC}"
   fi
 
-  echo "  Report: $report_file"
+  echo "    Report saved: $report_file"
 }
 
 # Main function
 main() {
-  echo -e "${BOLD}USB Drive Wiper Starting...${NC}"
+  echo -e "${BOLD}${BLUE}USB Drive Wiper${NC}"
+  echo "==============="
+  echo
 
   check_requirements
 
-  echo "Scanning for removable drives..."
-  mapfile -t drives < <(get_drives "auto")
+  echo "Scanning for all disk drives..."
+  mapfile -t drives < <(get_all_drives)
 
   if [[ ${#drives[@]} -eq 0 ]]; then
-    echo -e "${YELLOW}No removable drives found automatically.${NC}"
-    echo
-    echo "This could mean:"
-    echo "- No USB drives are connected"
-    echo "- USB drives appear as internal (common with adapters/VMs)"
-    echo "- USB passthrough issues in VM"
-    echo
-    echo -n "Would you like to see ALL disk drives for manual selection? (y/N): "
-    read -r manual_mode
-
-    if [[ "$manual_mode" =~ ^[Yy]$ ]]; then
-      echo "Scanning all disk drives..."
-      mapfile -t drives < <(get_drives "manual")
-
-      if [[ ${#drives[@]} -eq 0 ]]; then
-        echo -e "${RED}No disk drives found at all!${NC}"
-        echo "Check if running as root: sudo $0"
-        exit 1
-      fi
-
-      echo -e "${BOLD}${RED}MANUAL MODE - BE VERY CAREFUL!${NC}"
-      echo -e "${RED}You will see ALL disk drives including system drives.${NC}"
-      echo -e "${RED}Double-check your selections!${NC}"
-      echo
-      echo "Press Enter to continue..."
-      read -r
-    else
-      echo "Exiting. Make sure USB drives are properly connected."
-      exit 0
-    fi
+    echo -e "${RED}No disk drives found!${NC}"
+    echo "Check if running as root: sudo $0"
+    exit 1
   fi
 
-  # Display drives and get user selection
+  echo "Found ${#drives[@]} drive(s)"
+  echo
+
+  # Get user selection
   mapfile -t selected < <(get_selection "${drives[@]}")
 
-  # Confirm
+  # Final confirmation
   if ! confirm_wipe "${selected[@]}"; then
     echo "Operation cancelled."
     exit 0
@@ -453,8 +467,7 @@ main() {
   done
 
   echo -e "${GREEN}${BOLD}All operations completed!${NC}"
-  echo
-  echo "Reports are saved in /tmp/wipe_report_*"
+  echo "Reports saved in /tmp/wipe_report_*"
 }
 
 # Run main function
