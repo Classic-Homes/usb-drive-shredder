@@ -53,26 +53,66 @@ get_drives() {
   local drives=()
 
   if [[ "$(uname)" == "Darwin" ]]; then
-    # macOS: Find external/USB drives
-    while read -r device; do
-      if [[ "$device" =~ /dev/disk[0-9]+$ ]]; then
-        if diskutil info "$device" 2>/dev/null | grep -E "(Removable Media: +Yes|Protocol: +USB)" >/dev/null; then
-          drives+=("$device")
+    # macOS: Find external/USB drives with timeout protection
+    echo "  Checking macOS drives..." >&2
+
+    # Get device list first
+    local device_list
+    if ! device_list=$(timeout 10 diskutil list 2>/dev/null | grep -E "^/dev/disk[0-9]+" | awk '{print $1}'); then
+      echo "  Warning: diskutil list timed out or failed" >&2
+      return 0
+    fi
+
+    echo "$device_list" | while read -r device; do
+      if [[ -n "$device" && "$device" =~ /dev/disk[0-9]+$ ]]; then
+        echo "    Checking $device..." >&2
+
+        # Skip if not readable
+        if [[ ! -r "$device" ]]; then
+          echo "      Not readable, skipping" >&2
+          continue
+        fi
+
+        # Get device info with timeout
+        local info
+        if info=$(timeout 5 diskutil info "$device" 2>/dev/null); then
+          if echo "$info" | grep -E "(Removable Media: +Yes|Protocol: +USB)" >/dev/null; then
+            echo "      Found removable/USB drive: $device" >&2
+            drives+=("$device")
+          fi
+        else
+          echo "      Info check timed out, skipping" >&2
         fi
       fi
-    done < <(diskutil list | grep -E "^/dev/disk[0-9]+" | awk '{print $1}')
+    done
   else
-    # Linux: Find removable drives
-    while read -r line; do
-      local name=$(echo "$line" | awk '{print $1}')
-      local size=$(echo "$line" | awk '{print $4}')
-      local type=$(echo "$line" | awk '{print $6}')
-      local removable=$(echo "$line" | awk '{print $3}')
+    # Linux: Find removable drives with better error handling
+    echo "  Checking Linux drives..." >&2
 
-      if [[ "$type" == "disk" && "$removable" == "1" ]]; then
-        drives+=("/dev/$name")
+    local lsblk_output
+    if ! lsblk_output=$(timeout 10 lsblk -d -n -o NAME,MAJ:MIN,RM,SIZE,RO,TYPE 2>/dev/null); then
+      echo "  Warning: lsblk timed out or failed" >&2
+      return 0
+    fi
+
+    echo "$lsblk_output" | while read -r line; do
+      if [[ -n "$line" ]]; then
+        local name=$(echo "$line" | awk '{print $1}')
+        local removable=$(echo "$line" | awk '{print $3}')
+        local type=$(echo "$line" | awk '{print $6}')
+
+        echo "    Checking /dev/$name (type=$type, removable=$removable)..." >&2
+
+        if [[ "$type" == "disk" && "$removable" == "1" ]]; then
+          if [[ -r "/dev/$name" ]]; then
+            echo "      Found removable drive: /dev/$name" >&2
+            drives+=("/dev/$name")
+          else
+            echo "      Not readable, skipping" >&2
+          fi
+        fi
       fi
-    done < <(lsblk -d -n -o NAME,MAJ:MIN,RM,SIZE,RO,TYPE)
+    done
   fi
 
   printf '%s\n' "${drives[@]}"
@@ -354,7 +394,88 @@ main() {
   check_requirements
 
   echo "Scanning for drives..."
-  mapfile -t drives < <(get_drives)
+  echo "(This may take a few seconds on some systems)"
+
+  # Get drives with timeout protection
+  local drives_output
+  if drives_output=$(timeout 30 bash -c 'get_drives() {
+        local drives=()
+        
+        if [[ "$(uname)" == "Darwin" ]]; then
+            # macOS: Find external/USB drives with timeout protection
+            echo "  Checking macOS drives..." >&2
+            
+            # Get device list first
+            local device_list
+            if ! device_list=$(timeout 10 diskutil list 2>/dev/null | grep -E "^/dev/disk[0-9]+" | awk "{print \$1}"); then
+                echo "  Warning: diskutil list timed out or failed" >&2
+                return 0
+            fi
+            
+            echo "$device_list" | while read -r device; do
+                if [[ -n "$device" && "$device" =~ /dev/disk[0-9]+$ ]]; then
+                    echo "    Checking $device..." >&2
+                    
+                    # Skip if not readable
+                    if [[ ! -r "$device" ]]; then
+                        echo "      Not readable, skipping" >&2
+                        continue
+                    fi
+                    
+                    # Get device info with timeout
+                    local info
+                    if info=$(timeout 5 diskutil info "$device" 2>/dev/null); then
+                        if echo "$info" | grep -E "(Removable Media: +Yes|Protocol: +USB)" >/dev/null; then
+                            echo "      Found removable/USB drive: $device" >&2
+                            echo "$device"
+                        fi
+                    else
+                        echo "      Info check timed out, skipping" >&2
+                    fi
+                fi
+            done
+        else
+            # Linux: Find removable drives with better error handling
+            echo "  Checking Linux drives..." >&2
+            
+            local lsblk_output
+            if ! lsblk_output=$(timeout 10 lsblk -d -n -o NAME,MAJ:MIN,RM,SIZE,RO,TYPE 2>/dev/null); then
+                echo "  Warning: lsblk timed out or failed" >&2
+                return 0
+            fi
+            
+            echo "$lsblk_output" | while read -r line; do
+                if [[ -n "$line" ]]; then
+                    local name=$(echo "$line" | awk "{print \$1}")
+                    local removable=$(echo "$line" | awk "{print \$3}")
+                    local type=$(echo "$line" | awk "{print \$6}")
+                    
+                    echo "    Checking /dev/$name (type=$type, removable=$removable)..." >&2
+                    
+                    if [[ "$type" == "disk" && "$removable" == "1" ]]; then
+                        if [[ -r "/dev/$name" ]]; then
+                            echo "      Found removable drive: /dev/$name" >&2
+                            echo "/dev/$name"
+                        else
+                            echo "      Not readable, skipping" >&2
+                        fi
+                    fi
+                fi
+            done
+        fi
+    }; get_drives' 2>&1); then
+    # Extract just the device paths from the output
+    mapfile -t drives < <(echo "$drives_output" | grep "^/dev/" || true)
+  else
+    echo -e "${RED}Error: Drive scanning timed out after 30 seconds${NC}"
+    echo "This might indicate:"
+    echo "- Slow disk access (VM or hardware issue)"
+    echo "- Permission problems"
+    echo "- System overload"
+    echo
+    echo "Try running the debug script: sudo bash drive_debug.sh"
+    exit 1
+  fi
 
   # Get user selection
   mapfile -t selected < <(get_selection "${drives[@]}")
