@@ -83,8 +83,8 @@ get_all_drives_detailed() {
   # Get all block devices
   while IFS= read -r line; do
     local device=$(echo "$line" | awk '{print $1}')
-    local size=$(echo "$line" | awk '{print $4}')
-    local type=$(echo "$line" | awk '{print $6}')
+    local size=$(echo "$line" | awk '{print $2}')
+    local type=$(echo "$line" | awk '{print $3}')
 
     # Skip if not a disk or if it's a partition
     [[ "$type" != "disk" ]] && continue
