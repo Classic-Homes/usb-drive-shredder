@@ -74,56 +74,35 @@ get_all_drives() {
   printf '%s\n' "${drives[@]}"
 }
 
-# Get drive info with timeout protection
+# Get basic drive info (simplified to avoid hangs)
 get_drive_info() {
   local device="$1"
-  local vendor="Unknown"
-  local model="Unknown"
   local size="Unknown"
   local mounted=""
 
-  # Add timeout to prevent hanging
-  if [[ "$(uname)" == "Darwin" ]]; then
-    local info=$(timeout 5 diskutil info "$device" 2>/dev/null || echo "")
-    vendor=$(echo "$info" | grep "Device / Media Name" | sed 's/.*: *//' | awk '{print $1}' 2>/dev/null || echo "Unknown")
-    model=$(echo "$info" | grep "Device Model" | sed 's/.*: *//' 2>/dev/null || echo "Unknown")
-    size=$(echo "$info" | grep "Disk Size" | sed 's/.*: *//' | awk '{print $1" "$2}' 2>/dev/null || echo "Unknown")
+  # Just get size - this is the most reliable info
+  size=$(lsblk -d -no size "$device" 2>/dev/null || echo "Unknown")
 
-    # Check if mounted
-    if echo "$info" | grep -q "Mounted.*Yes" 2>/dev/null; then
-      mounted="MOUNTED"
-    fi
-  else
-    # Use timeout for all lsblk commands
-    vendor=$(timeout 3 lsblk -d -no vendor "$device" 2>/dev/null | xargs 2>/dev/null || echo "Unknown")
-    model=$(timeout 3 lsblk -d -no model "$device" 2>/dev/null | xargs 2>/dev/null || echo "Unknown")
-    size=$(timeout 3 lsblk -d -no size "$device" 2>/dev/null || echo "Unknown")
-
-    # Check if any partition is mounted (with timeout)
-    if timeout 3 lsblk -no mountpoint "$device" 2>/dev/null | grep -q "/" 2>/dev/null; then
-      mounted="MOUNTED"
-    fi
+  # Quick check if mounted (just check if any partition shows up in mount output)
+  if mount | grep -q "^$device" 2>/dev/null; then
+    mounted="MOUNTED"
   fi
 
-  echo "$vendor|$model|$size|$mounted"
+  # Simple format: just show size and mount status
+  echo "Drive|$size|$mounted"
 }
 
 # Determine safety level based on common patterns
 get_safety_level() {
   local device="$1"
   local info="$2"
-  local size=$(echo "$info" | cut -d'|' -f3)
-  local mounted=$(echo "$info" | cut -d'|' -f4)
+  local size=$(echo "$info" | cut -d'|' -f2)
+  local mounted=$(echo "$info" | cut -d'|' -f3)
 
   # Check for obvious system drive patterns
   if [[ "$(uname)" == "Darwin" ]]; then
     # macOS: disk0 is usually the system drive
     if [[ "$device" == "/dev/disk0" ]]; then
-      echo "SYSTEM"
-      return
-    fi
-    # Check if it's the boot drive
-    if diskutil info "$device" 2>/dev/null | grep -q "Boot Drive.*Yes"; then
       echo "SYSTEM"
       return
     fi
@@ -146,8 +125,8 @@ get_safety_level() {
     return
   fi
 
-  # Large drives might be important
-  if [[ "$size" =~ ([0-9]+).*TB ]] && [[ ${BASH_REMATCH[1]} -gt 1 ]]; then
+  # Large drives might be important (1TB+)
+  if [[ "$size" =~ ([0-9]+).*T ]] && [[ ${BASH_REMATCH[1]} -ge 1 ]]; then
     echo "CAUTION"
     return
   fi
@@ -179,15 +158,13 @@ display_drives() {
     local device="${drives[$i]}"
     local num=$((i + 1))
 
-    echo -n "  [$num] $device - "
+    echo -n "  [$num] $device "
 
     # Get info with error handling
     local info
     if info=$(get_drive_info "$device" 2>/dev/null); then
-      local vendor=$(echo "$info" | cut -d'|' -f1)
-      local model=$(echo "$info" | cut -d'|' -f2)
-      local size=$(echo "$info" | cut -d'|' -f3)
-      local mounted=$(echo "$info" | cut -d'|' -f4)
+      local size=$(echo "$info" | cut -d'|' -f2)
+      local mounted=$(echo "$info" | cut -d'|' -f3)
       local safety=$(get_safety_level "$device" "$info")
 
       # Format the display line
@@ -198,17 +175,17 @@ display_drives() {
 
       case "$safety" in
       "SAFE")
-        echo -e "$vendor $model ($size) ${GREEN}[SAFE]${NC}$mount_indicator"
+        echo -e "($size) ${GREEN}[SAFE]${NC}$mount_indicator"
         ;;
       "CAUTION")
-        echo -e "$vendor $model ($size) ${YELLOW}[CAUTION]${NC}$mount_indicator"
+        echo -e "($size) ${YELLOW}[CAUTION]${NC}$mount_indicator"
         ;;
       "SYSTEM")
-        echo -e "$vendor $model ($size) ${RED}[SYSTEM - DO NOT WIPE]${NC}$mount_indicator"
+        echo -e "($size) ${RED}[SYSTEM - DO NOT WIPE]${NC}$mount_indicator"
         ;;
       esac
     else
-      echo -e "${YELLOW}Info unavailable${NC}"
+      echo -e "${YELLOW}(Info unavailable)${NC}"
     fi
   done
   echo
@@ -267,8 +244,7 @@ get_selection() {
 
       if [[ "$safety" == "CAUTION" ]]; then
         echo -e "${YELLOW}WARNING: $device is marked as CAUTION${NC}"
-        echo -e "  Device: $device"
-        echo -e "  Info: $(echo "$info" | tr '|' ' - ')"
+        echo -e "  Device: $device ($(echo "$info" | cut -d'|' -f2))"
         echo -n "Are you sure? Type 'YES' to confirm: "
         read -r confirm
         if [[ "$confirm" != "YES" ]]; then
@@ -306,7 +282,8 @@ get_selection() {
     echo -e "${GREEN}Selected ${#selected[@]} drive(s):${NC}"
     for drive in "${selected[@]}"; do
       local info=$(get_drive_info "$drive")
-      echo "  $drive - $(echo "$info" | tr '|' ' - ')"
+      local size=$(echo "$info" | cut -d'|' -f2)
+      echo "  $drive ($size)"
     done
     echo
     echo -n "Proceed with these drives? (y/N): "
@@ -332,7 +309,8 @@ confirm_wipe() {
 
   for drive in "${drives[@]}"; do
     local info=$(get_drive_info "$drive")
-    echo -e "  ${YELLOW}$drive${NC} - $(echo "$info" | tr '|' ' - ')"
+    local size=$(echo "$info" | cut -d'|' -f2)
+    echo -e "  ${YELLOW}$drive${NC} ($size)"
   done
 
   echo
@@ -379,7 +357,9 @@ wipe_drive() {
     echo "Standard: DoD 5220.22-M (3 passes + zero)"
     echo
     echo "Drive Information:"
-    get_drive_info "$device" | tr '|' '\n' | nl -w2 -s': '
+    local info=$(get_drive_info "$device")
+    echo "Size: $(echo "$info" | cut -d'|' -f2)"
+    echo "Mount Status: $(echo "$info" | cut -d'|' -f3)"
     echo
     echo "Wipe Process:"
   } >"$report_file"
