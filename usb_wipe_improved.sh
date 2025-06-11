@@ -55,9 +55,9 @@ check_requirements() {
       if ! command -v "$cmd" >/dev/null 2>&1; then
         if [[ "$cmd" == "pv" ]]; then
           echo -e "${YELLOW}Warning: 'pv' not found. Progress bars will not be shown during wiping${NC}"
-        } else {
+        else
           missing+=("$cmd")
-        }
+        fi
       fi
     done
   fi
