@@ -75,47 +75,39 @@ check_requirements() {
 
 # Get all disk drives with enhanced detection
 get_all_drives() {
-  local drives=()
-
+  # Use a temporary file to store drives to avoid subshell issues with arrays
+  local temp_file=$(mktemp)
+  
   if [[ "$(uname)" == "Darwin" ]]; then
     # macOS: Get all disk drives, including external drives
-    local disk_list=$(diskutil list | grep -E "^/dev/disk[0-9]+")
-    while read -r line; do
+    diskutil list | grep -E "^/dev/disk[0-9]+" | while read -r line; do
       local device=$(echo "$line" | awk '{print $1}')
       if [[ -n "$device" && "$device" =~ /dev/disk[0-9]+$ && -r "$device" ]]; then
-        drives+=("$device")
+        echo "$device" >> "$temp_file"
       fi
-    done <<< "$disk_list"
+    done
 
     # Also check for any external physical disks that might not be captured above
     # Only attempt if the command is supported (newer macOS versions)
-    if diskutil help | grep -q "external"; then
-      local external_list=$(diskutil list external physical 2>/dev/null | grep -E "^/dev/disk[0-9]+" || echo "")
-      while read -r line; do
+    if diskutil help 2>/dev/null | grep -q "external"; then
+      diskutil list external physical 2>/dev/null | grep -E "^/dev/disk[0-9]+" | while read -r line; do
         if [[ -n "$line" ]]; then
           local device=$(echo "$line" | awk '{print $1}')
-          if [[ -n "$device" && ! " ${drives[*]} " =~ " $device " ]]; then
-            drives+=("$device")
+          # Check if device is already in our list
+          if ! grep -q "^$device$" "$temp_file"; then
+            echo "$device" >> "$temp_file"
           fi
         fi
-      done <<< "$external_list"
+      done
     fi
   else
     # Linux: Get all disk drives, focusing on physical and removable disks
-    local disk_list=$(lsblk -d -n -o NAME,TYPE,HOTPLUG,RM)
-    while read -r line; do
-      if [[ -n "$line" ]]; then
-        local name=$(echo "$line" | awk '{print $1}')
-        local type=$(echo "$line" | awk '{print $2}')
-        
-        if [[ "$type" == "disk" ]]; then
-          drives+=("/dev/$name")
-        fi
-      fi
-    done <<< "$disk_list"
+    lsblk -d -n -o NAME,TYPE | grep "disk" | awk '{print "/dev/"$1}' >> "$temp_file"
   fi
-
-  printf '%s\n' "${drives[@]}"
+  
+  # Output the result and clean up
+  cat "$temp_file"
+  rm "$temp_file"
 }
 
 # Get enhanced drive info with more details
@@ -342,7 +334,7 @@ get_selection() {
     
     if [[ "$selection" == "r" ]]; then
       echo "Refreshing drive list..."
-      mapfile -t new_drives < <(get_all_drives)
+      readarray -t new_drives < <(get_all_drives)
       drives=("${new_drives[@]}")
       continue
     fi
@@ -753,8 +745,10 @@ main() {
   check_requirements
 
   echo "Scanning for disk drives..."
-  mapfile -t drives < <(get_all_drives)
-
+  
+  # Get drives without using mapfile (which can cause issues)
+  readarray -t drives < <(get_all_drives)
+  
   if [[ ${#drives[@]} -eq 0 ]]; then
     echo -e "${RED}No disk drives found!${NC}"
     echo "Check if running as root: sudo $0"
@@ -765,7 +759,7 @@ main() {
   echo
 
   # Get user selection
-  mapfile -t selected < <(get_selection "${drives[@]}")
+  readarray -t selected < <(get_selection "${drives[@]}")
 
   # Final confirmation
   if ! confirm_wipe "${selected[@]}"; then
