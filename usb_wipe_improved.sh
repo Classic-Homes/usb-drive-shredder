@@ -79,34 +79,40 @@ get_all_drives() {
 
   if [[ "$(uname)" == "Darwin" ]]; then
     # macOS: Get all disk drives, including external drives
-    diskutil list | grep -E "^/dev/disk[0-9]+" | while read -r line; do
+    local disk_list=$(diskutil list | grep -E "^/dev/disk[0-9]+")
+    while read -r line; do
       local device=$(echo "$line" | awk '{print $1}')
       if [[ -n "$device" && "$device" =~ /dev/disk[0-9]+$ && -r "$device" ]]; then
         drives+=("$device")
       fi
-    done
+    done <<< "$disk_list"
 
     # Also check for any external physical disks that might not be captured above
-    diskutil list external physical | grep -E "^/dev/disk[0-9]+" | while read -r line; do
-      local device=$(echo "$line" | awk '{print $1}')
-      if [[ -n "$device" && ! " ${drives[*]} " =~ " $device " ]]; then
-        drives+=("$device")
-      fi
-    done
+    # Only attempt if the command is supported (newer macOS versions)
+    if diskutil help | grep -q "external"; then
+      local external_list=$(diskutil list external physical 2>/dev/null | grep -E "^/dev/disk[0-9]+" || echo "")
+      while read -r line; do
+        if [[ -n "$line" ]]; then
+          local device=$(echo "$line" | awk '{print $1}')
+          if [[ -n "$device" && ! " ${drives[*]} " =~ " $device " ]]; then
+            drives+=("$device")
+          fi
+        fi
+      done <<< "$external_list"
+    fi
   else
     # Linux: Get all disk drives, focusing on physical and removable disks
-    lsblk -d -n -o NAME,TYPE,HOTPLUG,RM | while read -r line; do
+    local disk_list=$(lsblk -d -n -o NAME,TYPE,HOTPLUG,RM)
+    while read -r line; do
       if [[ -n "$line" ]]; then
         local name=$(echo "$line" | awk '{print $1}')
         local type=$(echo "$line" | awk '{print $2}')
-        local hotplug=$(echo "$line" | awk '{print $3}')
-        local removable=$(echo "$line" | awk '{print $4}')
         
         if [[ "$type" == "disk" ]]; then
           drives+=("/dev/$name")
         fi
       fi
-    done
+    done <<< "$disk_list"
   fi
 
   printf '%s\n' "${drives[@]}"
